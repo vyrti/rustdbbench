@@ -101,27 +101,17 @@ Test performance with 1 million operations, 100 concurrent clients, 1KB JSON val
   --pipeline \
   --batch-size 100
 ```
-  --batch-size 100
-IGNORE_WHEN_COPYING_START
-content_copy
-download
-Use code with caution.
-Sh
-IGNORE_WHEN_COPYING_END
 
 Example 3: Test Rkyv Zero-Copy Read Performance
 
 Isolate and measure read performance using the rkyv format with zero-copy reads enabled. This test will pre-populate the databases before running the read benchmark.
 
-Generated sh
+```sh
 ./kv_benchmark/target/maxperf/kv_benchmark --read-only --format rkyv --zero-copy-read
 IGNORE_WHEN_COPYING_START
 content_copy
 download
-Use code with caution.
-Sh
-IGNORE_WHEN_COPYING_END
-Sample Benchmark Results
+```
 
 Note: The following results were captured on a specific machine and are for illustrative purposes. Your mileage will vary based on hardware and workload. All tests were run with -n 100000 -c 100 --pipeline.
 

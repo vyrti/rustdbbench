@@ -102,15 +102,12 @@ Test performance with 1 million operations, 100 concurrent clients, 1KB JSON val
   --batch-size 100
 ```
 
-Example 3: Test Rkyv Zero-Copy Read Performance
+**Example 3: Test Rkyv Zero-Copy Read Performance**
 
 Isolate and measure read performance using the rkyv format with zero-copy reads enabled. This test will pre-populate the databases before running the read benchmark.
 
 ```sh
 ./kv_benchmark/target/maxperf/kv_benchmark --read-only --format rkyv --zero-copy-read
-IGNORE_WHEN_COPYING_START
-content_copy
-download
 ```
 
 Note: The following results were captured on a specific machine and are for illustrative purposes. Your mileage will vary based on hardware and workload. All tests were run with -n 100000 -c 100 --pipeline.
@@ -143,6 +140,6 @@ Redis	READ (Zero-Copy)	132,707.57	0.754
 Valkey	WRITE	86,961.77	1.150
 Valkey	READ (Zero-Copy)	136,438.13	0.733
 
-License
+**License**
 
 This project is licensed under the MIT License. See the LICENSE file for details.

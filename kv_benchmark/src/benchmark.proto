@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+// The package name will be used as the module name in the generated Rust code.
+package benchmark;
+
+message BenchmarkPayload {
+  string data = 1;
+  uint64 timestamp = 2;
+  uint64 id = 3;
+}

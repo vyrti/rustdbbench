@@ -1,4 +1,9 @@
-# Redis vs. Valkey Benchmark
+# 100% AI Generated
+
+This software code was generated 100% using AI tools such as Google Gemini 2.5 Pro and Claude Sonnet 4.
+Please be aware of potential legal risks associated with using AI-generated code, including but not limited to copyright infringement or lack of ownership.
+
+# Rust Database Benchmark
 
 A high-performance, configurable benchmarking tool written in Rust to compare the performance of Redis and Valkey.
 

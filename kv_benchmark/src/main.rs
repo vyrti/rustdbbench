@@ -1,12 +1,10 @@
 use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::{
-    Rng,
-    distributions::{Alphanumeric, Distribution}
-};
+use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng, SeedableRng};
 use redis::AsyncCommands;
 use rkyv::{
-    from_bytes, rancor::Error as RkyvError, to_bytes, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
+    from_bytes, rancor::Error as RkyvError, to_bytes, Archive, Deserialize as RkyvDeserialize,
+    Serialize as RkyvSerialize,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -22,7 +20,7 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/benchmark.rs"));
 }
 
-const DEFAULT_KEY_PREFIX: &str = "benchkey";
+const DEFAULT_KEY_PREFIX: &str = "chat";
 const DEFAULT_BATCH_SIZE: usize = 50;
 const PROGRESS_UPDATE_INTERVAL: usize = 1000;
 
@@ -32,10 +30,10 @@ enum DataFormat {
     Json,
     Bitcode,
     Protobuf,
-    Rkyv, // New format option
+    Rkyv,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[clap(author, version, about, long_about = None)]
 struct Cli {
     #[clap(short, long, default_value = "redis://127.0.0.1:6379")]
@@ -44,20 +42,26 @@ struct Cli {
     #[clap(short, long, default_value = "redis://127.0.0.1:6380")]
     valkey_url: String,
 
-    #[clap(short, long, default_value_t = 100_000)]
+    #[clap(short = 'o', long, default_value_t = 100_000, help="Total number of operations to perform.")]
     num_ops: usize,
 
-    #[clap(short, long, default_value_t = 50)]
+    #[clap(short, long, default_value_t = 50, help="Number of concurrent client threads.")]
     concurrency: usize,
 
-    #[clap(long, default_value_t = 16)]
-    key_size: usize,
-
-    #[clap(long, default_value_t = 128)]
+    #[clap(long, default_value_t = 128, help="Base size in bytes for the data part of a message payload.")]
     value_size: usize,
 
     #[clap(long, value_enum, default_value_t = DataFormat::String, help = "Data serialization format for values")]
     format: DataFormat,
+
+    #[clap(long, default_value_t = 1000, help="Number of simulated chat rooms.")]
+    num_chats: usize,
+    
+    #[clap(long, default_value_t = 100, help="Number of messages to keep in chat history (for LTRIM).")]
+    history_len: usize,
+
+    #[clap(long, default_value_t = 50, help="Number of messages to fetch in a single READ operation (for LRANGE).")]
+    read_size: usize,
 
     #[clap(long, help = "Run only write benchmarks")]
     write_only: bool,
@@ -101,32 +105,25 @@ struct PreGeneratedData {
 }
 
 impl PreGeneratedData {
-    fn new(num_ops: usize, key_size: usize, value_size: usize, op_type_for_values: &str, format: DataFormat) -> Self {
+    fn new(cli: &Cli, op_type_for_values: &str) -> Self {
         let mut rng = rand::thread_rng();
         println!(
-            "Pre-generating {} keys ({}B) and potentially values (base size {}B) using {:?} format...",
-            num_ops, key_size, if op_type_for_values == "WRITE" { value_size } else { 0 }, format
+            "Pre-generating {} chat room keys and potentially {} message values (base size {}B) using {:?} format...",
+            cli.num_chats, if op_type_for_values == "WRITE" { cli.num_ops } else { 0 }, cli.value_size, cli.format
         );
 
         let keys = Arc::new(
-            (0..num_ops)
-                .map(|i| {
-                    let random_suffix_len = key_size.saturating_sub(DEFAULT_KEY_PREFIX.len() + 6);
-                    let random_suffix = generate_random_string(random_suffix_len, &mut rng);
-                    format!("{}:{:05}:{}", DEFAULT_KEY_PREFIX, i % (num_ops / 10).max(1), random_suffix)
-                        .chars()
-                        .take(key_size)
-                        .collect::<String>()
-                })
+            (0..cli.num_chats)
+                .map(|i| format!("{}:{}", DEFAULT_KEY_PREFIX, i))
                 .collect::<Vec<_>>(),
         );
 
         let values = if op_type_for_values == "WRITE" {
-            let values_bytes: Vec<Vec<u8>> = (0..num_ops).map(|i| {
-                let random_data = generate_random_string(value_size, &mut rng);
+            let values_bytes: Vec<Vec<u8>> = (0..cli.num_ops).map(|i| {
+                let random_data = generate_random_string(cli.value_size, &mut rng);
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-                match format {
+                match cli.format {
                     DataFormat::String => random_data.into_bytes(),
                     DataFormat::Json => {
                         let payload = BenchmarkPayload { data: random_data, timestamp, id: i };
@@ -146,8 +143,6 @@ impl PreGeneratedData {
                     },
                     DataFormat::Rkyv => {
                         let payload = BenchmarkPayload { data: random_data, timestamp, id: i };
-                        // Correct API for rkyv 0.8+ requires an error type that implements `rancor::Source`.
-                        // RkyvError is the canonical choice.
                         to_bytes::<RkyvError>(&payload).unwrap().into_vec()
                     }
                 }
@@ -185,38 +180,34 @@ async fn run_benchmark(
     db_name: &str,
     op_type_ref: &str,
     db_url_slice: &str,
-    num_ops: usize,
-    concurrency: usize,
+    cli: &Cli,
     data: &PreGeneratedData,
-    use_pipeline: bool,
-    batch_size: usize,
     track_latency: bool,
-    format: DataFormat,
-    zero_copy_read: bool,
 ) -> Result<BenchResult, Box<dyn std::error::Error>> {
     let op_type_owned = op_type_ref.to_string();
 
-    let mode_str = if use_pipeline { "PIPELINED" } else { "INDIVIDUAL" };
-    let read_mode_str = if op_type_owned == "READ" && zero_copy_read { " (Zero-Copy)" } else { "" };
+    let mode_str = if cli.pipeline { "PIPELINED" } else { "INDIVIDUAL" };
+    let read_mode_str = if op_type_owned == "READ" && cli.zero_copy_read { " (Zero-Copy)" } else { "" };
     println!(
-        "\nBenchmarking {} {}{} ({:?} format, {} ops, {} concurrent, {} mode)...",
+        "\nBenchmarking {} {} (Chat Sim){}{} ({:?} format, {} ops, {} concurrent, {} mode)...",
         db_name,
         op_type_owned,
         read_mode_str,
-        format,
-        num_ops,
-        concurrency,
+        if op_type_owned == "READ" { format!(" READ_SIZE: {}", cli.read_size) } else { "".to_string() },
+        cli.format,
+        cli.num_ops,
+        cli.concurrency,
         mode_str,
     );
     
     let client = redis::Client::open(db_url_slice)?;
-    let mut connections = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
+    let mut connections = Vec::with_capacity(cli.concurrency);
+    for _ in 0..cli.concurrency {
         connections.push(client.get_multiplexed_async_connection().await?);
     }
     let connections = Arc::new(connections);
 
-    let pb = ProgressBar::new(num_ops as u64);
+    let pb = ProgressBar::new(cli.num_ops as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
@@ -227,20 +218,25 @@ async fn run_benchmark(
     let pb_arc = Arc::new(pb);
 
     let start_time = Instant::now();
-    let mut tasks = Vec::with_capacity(concurrency);
-    let ops_per_worker = (num_ops + concurrency - 1) / concurrency;
+    let mut tasks = Vec::with_capacity(cli.concurrency);
+    let ops_per_worker = (cli.num_ops + cli.concurrency - 1) / cli.concurrency;
 
-    for worker_id in 0..concurrency {
+    for worker_id in 0..cli.concurrency {
         let mut conn = connections[worker_id % connections.len()].clone();
         let keys_ref = Arc::clone(&data.keys);
         let values_ref = data.values.as_ref().map(Arc::clone);
         let progress_bar_clone = Arc::clone(&pb_arc);
         let task_op_type = op_type_owned.clone();
-        let task_data_format = format;
-        let task_zero_copy_read = zero_copy_read;
+        
+        let task_format = cli.format;
+        let task_zero_copy_read = cli.zero_copy_read;
+        let use_pipeline = cli.pipeline;
+        let batch_size = cli.batch_size;
+        let history_len = cli.history_len;
+        let read_size = cli.read_size;
 
         let worker_start_idx = worker_id * ops_per_worker;
-        let worker_end_idx = ((worker_id + 1) * ops_per_worker).min(num_ops);
+        let worker_end_idx = ((worker_id + 1) * ops_per_worker).min(cli.num_ops);
 
         if worker_start_idx >= worker_end_idx { continue; }
 
@@ -252,26 +248,44 @@ async fn run_benchmark(
             let mut local_ops_done: usize = 0;
             let num_worker_ops = worker_end_idx - worker_start_idx;
             let mut worker_progress_counter: u64 = 0;
+            let mut rng = StdRng::from_entropy();
 
             if use_pipeline {
                 for chunk_start_offset in (0..num_worker_ops).step_by(batch_size) {
                     let current_batch_size = (chunk_start_offset + batch_size).min(num_worker_ops) - chunk_start_offset;
                     if current_batch_size == 0 { continue; }
-                    let mut pipe = redis::pipe();
-                    for i in 0..current_batch_size {
-                        let op_idx = worker_start_idx + chunk_start_offset + i;
-                        let key = &keys_ref[op_idx];
-                        if task_op_type == "WRITE" {
+                    
+                    if task_op_type == "WRITE" {
+                        let mut pipe = redis::pipe();
+                        for i in 0..current_batch_size {
+                            let op_idx = worker_start_idx + chunk_start_offset + i;
+                            let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
                             let value = &values_ref.as_ref().unwrap()[op_idx];
-                            pipe.cmd("SET").arg(key).arg(value).ignore();
-                        } else {
-                            pipe.cmd("GET").arg(key).ignore();
+                            pipe.lpush(key, value).ltrim(key, 0, history_len as isize - 1).ignore();
+                        }
+                        match pipe.query_async::<()>(&mut conn).await {
+                            Ok(_) => { local_ops_done += current_batch_size; }
+                            Err(_) => { local_errors += current_batch_size; }
+                        }
+                    } else { // READ
+                        let mut pipe = redis::pipe();
+                        for _ in 0..current_batch_size {
+                            let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
+                            pipe.lrange(key, 0, read_size as isize - 1);
+                        }
+                        match pipe.query_async::<Vec<Vec<Vec<u8>>>>(&mut conn).await {
+                            Ok(results) => {
+                                for messages in results {
+                                    if !process_read_result(messages, task_format, task_zero_copy_read) {
+                                        local_errors += 1; // Count batch as 1 error if any sub-op fails
+                                    }
+                                }
+                                local_ops_done += current_batch_size;
+                            },
+                            Err(_) => { local_errors += current_batch_size; }
                         }
                     }
-                    match pipe.query_async::<()>(&mut conn).await {
-                        Ok(_) => { local_ops_done += current_batch_size; }
-                        Err(_) => { local_errors += current_batch_size; local_ops_done += current_batch_size; }
-                    }
+
                     worker_progress_counter += current_batch_size as u64;
                     if worker_progress_counter >= PROGRESS_UPDATE_INTERVAL as u64 {
                         progress_bar_clone.inc(worker_progress_counter);
@@ -281,37 +295,18 @@ async fn run_benchmark(
             } else { // Individual commands
                 for i in 0..num_worker_ops {
                     let op_idx = worker_start_idx + i;
-                    let key = &keys_ref[op_idx];
+                    let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
                     let op_start_time = if track_latency { Some(Instant::now()) } else { None };
                     
                     let op_successful = if task_op_type == "WRITE" {
                         let value = &values_ref.as_ref().unwrap()[op_idx];
-                        conn.set::<_, _, ()>(key, value).await.is_ok()
+                        let mut pipe = redis::pipe();
+                        pipe.lpush(key, value).ltrim(key, 0, history_len as isize - 1).ignore();
+                        pipe.query_async::<()>(&mut conn).await.is_ok()
                     } else { // READ operation
-                        let res: redis::RedisResult<Option<Vec<u8>>> = conn.get(key).await;
-                        match res {
-                            Ok(Some(bytes)) => {
-                                if task_zero_copy_read {
-                                    if matches!(task_data_format, DataFormat::Rkyv) {
-                                        // For zero-copy with rkyv, just validate the archive structure
-                                        // In rkyv 0.8+, we can use from_bytes but skip actual deserialization
-                                        bytes.len() >= 4 // Basic size check - real validation would be more complex
-                                    } else {
-                                        true
-                                    }
-                                } else {
-                                    match task_data_format {
-                                        DataFormat::Json => serde_json::from_slice::<BenchmarkPayload>(&bytes).is_ok(),
-                                        DataFormat::Bitcode => bitcode::deserialize::<BenchmarkPayload>(&bytes).is_ok(),
-                                        DataFormat::String => String::from_utf8(bytes).is_ok(),
-                                        DataFormat::Protobuf => pb::BenchmarkPayload::decode(bytes.as_slice()).is_ok(),
-                                        // Correct API for rkyv 0.8+, requires a second generic arg for the error type.
-                                        DataFormat::Rkyv => from_bytes::<BenchmarkPayload, RkyvError>(&bytes).is_ok(),
-                                    }
-                                }
-                            },
-                            Ok(None) => false, // key not found
-                            Err(_) => false,
+                        match conn.lrange(key, 0, read_size as isize - 1).await {
+                            Ok(messages) => process_read_result(messages, task_format, task_zero_copy_read),
+                            Err(_) => false
                         }
                     };
 
@@ -339,12 +334,12 @@ async fn run_benchmark(
     let worker_results = futures::future::join_all(tasks).await;
     let total_time = start_time.elapsed();
     
-    if pb_arc.position() < num_ops as u64 && num_ops > 0 {
-        pb_arc.set_position(num_ops as u64);
+    if pb_arc.position() < cli.num_ops as u64 && cli.num_ops > 0 {
+        pb_arc.set_position(cli.num_ops as u64);
     }
     pb_arc.finish_with_message(format!("{} {} {} Done", db_name, op_type_owned, mode_str));
 
-    let mut final_histogram = if track_latency && !use_pipeline {
+    let mut final_histogram = if track_latency && !cli.pipeline {
         Some(hdrhistogram::Histogram::<u64>::new(3).unwrap())
     } else { None };
     let mut total_errors = 0;
@@ -359,16 +354,16 @@ async fn run_benchmark(
             }
             Err(e) => {
                 eprintln!("Worker task panicked: {}", e);
-                total_errors += num_ops / concurrency.max(1);
+                total_errors += cli.num_ops / cli.concurrency.max(1);
             }
         }
     }
 
     if total_errors > 0 {
-        println!("WARNING: {}/{} operations reported errors for {} {}", total_errors, num_ops, db_name, op_type_owned);
+        println!("WARNING: {}/{} operations reported errors for {} {}", total_errors, cli.num_ops, db_name, op_type_owned);
     }
 
-    let successful_ops = num_ops.saturating_sub(total_errors);
+    let successful_ops = cli.num_ops.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 {
         successful_ops as f64 / total_time.as_secs_f64()
     } else { if successful_ops > 0 { f64::INFINITY } else { 0.0 } };
@@ -381,17 +376,54 @@ async fn run_benchmark(
     Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors })
 }
 
+fn process_read_result(messages: Vec<Vec<u8>>, format: DataFormat, zero_copy: bool) -> bool {
+    if messages.is_empty() { return true; }
+
+    if zero_copy {
+        for bytes in &messages {
+            let ok = if matches!(format, DataFormat::Rkyv) {
+                if let Ok(archived) = from_bytes::<BenchmarkPayload, RkyvError>(bytes) {
+                    let _ = archived.id; // Simulate field access
+                    true
+                } else { false }
+            } else {
+                true // For other formats, zero-copy means not processing the bytes
+            };
+            if !ok { return false; }
+        }
+    } else {
+        for bytes in &messages {
+            let ok = match format {
+                DataFormat::Json => serde_json::from_slice::<BenchmarkPayload>(bytes).is_ok(),
+                DataFormat::Bitcode => bitcode::deserialize::<BenchmarkPayload>(bytes).is_ok(),
+                DataFormat::String => String::from_utf8(bytes.to_vec()).is_ok(),
+                DataFormat::Protobuf => pb::BenchmarkPayload::decode(bytes.as_slice()).is_ok(),
+                DataFormat::Rkyv => {
+                    match from_bytes::<BenchmarkPayload, RkyvError>(bytes) {
+                        Ok(archived) => {
+                            let _ = archived.id;
+                            true
+                        },
+                        Err(_) => false
+                    }
+                },
+            };
+            if !ok { return false; }
+        }
+    }
+    true
+}
+
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    println!(
-        "Configuration: Ops={}, Concurrency={}, Format={:?}, Key={}B, ValBase={}B, Pipeline={}, BatchSize={}, NoLatency={}, ZeroCopyRead={}",
-        cli.num_ops, cli.concurrency, cli.format, cli.key_size, cli.value_size, cli.pipeline, cli.batch_size, cli.no_latency, cli.zero_copy_read
-    );
+    println!("Configuration: Ops={}, Concurrency={}, Format={:?}, ValueBaseSize={}B", cli.num_ops, cli.concurrency, cli.format, cli.value_size);
+    println!("Chat Simulation: Chats={}, HistoryLen={}, ReadSize={}", cli.num_chats, cli.history_len, cli.read_size);
+    println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, ZeroCopyRead={}", cli.pipeline, cli.batch_size, cli.no_latency, cli.zero_copy_read);
     println!("Ensure Redis is running on {} and Valkey on {}", cli.redis_url, cli.valkey_url);
 
     if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
-    let safe_concurrency = cli.concurrency.max(1);
 
     let benchmarks_to_run = match (cli.write_only, cli.read_only) {
         (true, false) => vec!["WRITE"],
@@ -402,17 +434,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let track_latency_globally = !cli.no_latency;
 
-    let write_data = PreGeneratedData::new(cli.num_ops, cli.key_size, cli.value_size, "WRITE", cli.format);
+    let write_data = PreGeneratedData::new(&cli, "WRITE");
     let read_data = PreGeneratedData { keys: Arc::clone(&write_data.keys), values: None };
 
     if benchmarks_to_run.contains(&"READ") {
-        let pre_populate_pipeline = true;
-        let pre_populate_batch_size = cli.batch_size.max(200);
-        let pre_populate_track_latency = false;
+        let mut prepop_cli = cli.clone();
+        prepop_cli.pipeline = true;
+        prepop_cli.batch_size = cli.batch_size.max(200);
+
         println!("\nINFO: Pre-populating Redis for READ benchmark...");
-        run_benchmark("Redis-PrePop", "WRITE", &cli.redis_url, cli.num_ops, safe_concurrency, &write_data, pre_populate_pipeline, pre_populate_batch_size, pre_populate_track_latency, cli.format, false).await?;
+        run_benchmark("Redis-PrePop", "WRITE", &cli.redis_url, &prepop_cli, &write_data, false).await?;
         println!("\nINFO: Pre-populating Valkey for READ benchmark...");
-        run_benchmark("Valkey-PrePop", "WRITE", &cli.valkey_url, cli.num_ops, safe_concurrency, &write_data, pre_populate_pipeline, pre_populate_batch_size, pre_populate_track_latency, cli.format, false).await?;
+        run_benchmark("Valkey-PrePop", "WRITE", &cli.valkey_url, &prepop_cli, &write_data, false).await?;
     }
 
     let mut results_table = Vec::new();
@@ -421,9 +454,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for op_type_str_ref in &benchmarks_to_run {
             let current_data = if *op_type_str_ref == "WRITE" { &write_data } else { &read_data };
             let actual_track_latency = track_latency_globally && !cli.pipeline;
-            let zero_copy_for_this_run = if *op_type_str_ref == "READ" { cli.zero_copy_read } else { false };
 
-            match run_benchmark(db_type, op_type_str_ref, url_string.as_str(), cli.num_ops, safe_concurrency, current_data, cli.pipeline, cli.batch_size, actual_track_latency, cli.format, zero_copy_for_this_run).await {
+            match run_benchmark(db_type, op_type_str_ref, url_string.as_str(), &cli, current_data, actual_track_latency).await {
                 Ok(result) => { results_table.push(( *db_type, *op_type_str_ref, result.ops_per_second, result.total_time.as_secs_f64(), result.avg_latency_ms, result.p99_latency_ms, result.errors )); },
                 Err(e) => {
                     eprintln!("Error benchmarking {} {}: {}", db_type, op_type_str_ref, e);
@@ -446,27 +478,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\n--- Benchmark Summary (Format: {:?}) ---", cli.format);
+    println!("\n--- Benchmark Summary (Format: {:?}, Workload: Chat Simulation) ---", cli.format);
     let show_latency_in_table = track_latency_globally && !cli.pipeline;
     if show_latency_in_table {
-        println!("{:<15} | {:<18} | {:<15} | {:<12} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Total Time(s)", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
-        println!("{:-<16}|{:-<20}|{:-<17}|{:-<14}|{:-<14}|{:-<14}|{:-<10}", "", "", "", "", "", "", "");
+        println!("{:<15} | {:<20} | {:<15} | {:<12} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Total Time(s)", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
+        println!("{:-<16}|{:-<22}|{:-<17}|{:-<14}|{:-<14}|{:-<14}|{:-<10}", "", "", "", "", "", "", "");
     } else {
-        println!("{:<15} | {:<18} | {:<15} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Total Time(s)", "Errors");
-        println!("{:-<16}|{:-<20}|{:-<17}|{:-<14}|{:-<10}", "", "", "", "", "");
+        println!("{:<15} | {:<20} | {:<15} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Total Time(s)", "Errors");
+        println!("{:-<16}|{:-<22}|{:-<17}|{:-<14}|{:-<10}", "", "", "", "", "");
     }
 
     for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors) in results_table.iter() {
-        let op_name = if *op == "READ" && cli.zero_copy_read {
-            "READ (Zero-Copy)".to_string()
+        let op_name = if *op == "READ" {
+            if cli.zero_copy_read { "READ (Chat, ZC)".to_string() } else { "READ (Chat)".to_string() }
         } else {
-            op.to_string()
+            "WRITE (Chat)".to_string()
         };
 
         if show_latency_in_table {
-            println!("{:<15} | {:<18} | {:<15.2} | {:<12.3} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, ops_sec, time_s, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
+            println!("{:<15} | {:<20} | {:<15.2} | {:<12.3} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, ops_sec, time_s, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
         } else {
-            println!("{:<15} | {:<18} | {:<15.2} | {:<12.3} | {:<8}", db, op_name, ops_sec, time_s, errors);
+            println!("{:<15} | {:<20} | {:<15.2} | {:<12.3} | {:<8}", db, op_name, ops_sec, time_s, errors);
         }
     }
 

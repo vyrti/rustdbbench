@@ -1,3 +1,4 @@
+use byte_unit::{Byte, UnitType};
 use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng, SeedableRng};
@@ -6,9 +7,12 @@ use rkyv::{
     from_bytes, rancor::Error as RkyvError, to_bytes, Archive, Deserialize as RkyvDeserialize,
     Serialize as RkyvSerialize,
 };
-use serde::{Deserialize, Serialize};
+use rkyv::Deserialize;
+// use serde::{Deserialize, Serialize};
+use serde::{Deserialize as SerdeDeserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zstd::stream::{decode_all, encode_all};
 
 use bitcode;
 // Import the Message trait from prost, which provides encode/decode methods.
@@ -56,7 +60,7 @@ struct Cli {
 
     #[clap(long, default_value_t = 1000, help="Number of simulated chat rooms.")]
     num_chats: usize,
-    
+
     #[clap(long, default_value_t = 100, help="Number of messages to keep in chat history (for LTRIM).")]
     history_len: usize,
 
@@ -80,9 +84,13 @@ struct Cli {
 
     #[clap(long, help = "Simulate zero-copy reads by skipping/optimizing deserialization")]
     zero_copy_read: bool,
+
+    #[clap(long, help = "Enable zstd compression for values")]
+    compress_zstd: bool,
 }
 
-#[derive(Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize, Debug, Clone)]
+// #[derive(Serialize, Deserialize, Archive, RkyvDeserialize, RkyvSerialize, Debug, Clone)]
+#[derive(Serialize, SerdeDeserialize, Archive, RkyvDeserialize, RkyvSerialize, Debug, Clone)]
 struct BenchmarkPayload {
     data: String,
     timestamp: u64,
@@ -123,7 +131,7 @@ impl PreGeneratedData {
                 let random_data = generate_random_string(cli.value_size, &mut rng);
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-                match cli.format {
+                let serialized_bytes = match cli.format {
                     DataFormat::String => random_data.into_bytes(),
                     DataFormat::Json => {
                         let payload = BenchmarkPayload { data: random_data, timestamp, id: i };
@@ -145,13 +153,21 @@ impl PreGeneratedData {
                         let payload = BenchmarkPayload { data: random_data, timestamp, id: i };
                         to_bytes::<RkyvError>(&payload).unwrap().into_vec()
                     }
+                };
+
+                if cli.compress_zstd {
+                    // Using compression level 0 is a default that's fast.
+                    encode_all(serialized_bytes.as_slice(), 0).unwrap()
+                } else {
+                    serialized_bytes
                 }
             }).collect();
 
             if !values_bytes.is_empty() {
                  let total_bytes: usize = values_bytes.iter().map(|v| v.len()).sum();
                  let avg_size = total_bytes as f64 / values_bytes.len() as f64;
-                 println!("Pre-generated {} values. Average serialized value size: {:.2} B.", values_bytes.len(), avg_size);
+                 let compressed_str = if cli.compress_zstd { " (compressed)" } else { "" };
+                 println!("Pre-generated {} values. Average serialized value size{}: {:.2} B.", values_bytes.len(), compressed_str, avg_size);
             }
             Some(Arc::new(values_bytes))
         } else {
@@ -168,12 +184,17 @@ struct BenchResult {
     avg_latency_ms: Option<f64>,
     p99_latency_ms: Option<f64>,
     errors: usize,
+    total_bytes_written: u64,
+    // CORRECTED: Typo u664 -> u64
+    total_bytes_read: u64,
 }
 
 struct WorkerResult {
     histogram: Option<hdrhistogram::Histogram<u64>>,
     errors: usize,
     ops_done: usize,
+    bytes_written: u64,
+    bytes_read: u64,
 }
 
 async fn run_benchmark(
@@ -189,12 +210,13 @@ async fn run_benchmark(
     let mode_str = if cli.pipeline { "PIPELINED" } else { "INDIVIDUAL" };
     let read_mode_str = if op_type_owned == "READ" && cli.zero_copy_read { " (Zero-Copy)" } else { "" };
     println!(
-        "\nBenchmarking {} {} (Chat Sim){}{} ({:?} format, {} ops, {} concurrent, {} mode)...",
+        "\nBenchmarking {} {} (Chat Sim){}{} ({:?}{} format, {} ops, {} concurrent, {} mode)...",
         db_name,
         op_type_owned,
         read_mode_str,
         if op_type_owned == "READ" { format!(" READ_SIZE: {}", cli.read_size) } else { "".to_string() },
         cli.format,
+        if cli.compress_zstd { "+zstd" } else { "" },
         cli.num_ops,
         cli.concurrency,
         mode_str,
@@ -234,6 +256,7 @@ async fn run_benchmark(
         let batch_size = cli.batch_size;
         let history_len = cli.history_len;
         let read_size = cli.read_size;
+        let use_compression = cli.compress_zstd;
 
         let worker_start_idx = worker_id * ops_per_worker;
         let worker_end_idx = ((worker_id + 1) * ops_per_worker).min(cli.num_ops);
@@ -246,6 +269,8 @@ async fn run_benchmark(
             } else { None };
             let mut local_errors: usize = 0;
             let mut local_ops_done: usize = 0;
+            let mut local_bytes_written: u64 = 0;
+            let mut local_bytes_read: u64 = 0;
             let num_worker_ops = worker_end_idx - worker_start_idx;
             let mut worker_progress_counter: u64 = 0;
             let mut rng = StdRng::from_entropy();
@@ -261,6 +286,7 @@ async fn run_benchmark(
                             let op_idx = worker_start_idx + chunk_start_offset + i;
                             let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
                             let value = &values_ref.as_ref().unwrap()[op_idx];
+                            local_bytes_written += value.len() as u64;
                             pipe.lpush(key, value).ltrim(key, 0, history_len as isize - 1).ignore();
                         }
                         match pipe.query_async::<()>(&mut conn).await {
@@ -275,9 +301,15 @@ async fn run_benchmark(
                         }
                         match pipe.query_async::<Vec<Vec<Vec<u8>>>>(&mut conn).await {
                             Ok(results) => {
+                                local_bytes_read += results
+                                    .iter()
+                                    .flat_map(|messages| messages.iter())
+                                    .map(|message_bytes| message_bytes.len() as u64)
+                                    .sum::<u64>();
+
                                 for messages in results {
-                                    if !process_read_result(messages, task_format, task_zero_copy_read) {
-                                        local_errors += 1; // Count batch as 1 error if any sub-op fails
+                                    if !process_read_result(messages, task_format, task_zero_copy_read, use_compression) {
+                                        local_errors += 1;
                                     }
                                 }
                                 local_ops_done += current_batch_size;
@@ -300,12 +332,16 @@ async fn run_benchmark(
                     
                     let op_successful = if task_op_type == "WRITE" {
                         let value = &values_ref.as_ref().unwrap()[op_idx];
+                        local_bytes_written += value.len() as u64;
                         let mut pipe = redis::pipe();
                         pipe.lpush(key, value).ltrim(key, 0, history_len as isize - 1).ignore();
                         pipe.query_async::<()>(&mut conn).await.is_ok()
                     } else { // READ operation
-                        match conn.lrange(key, 0, read_size as isize - 1).await {
-                            Ok(messages) => process_read_result(messages, task_format, task_zero_copy_read),
+                        match conn.lrange::<&str, Vec<Vec<u8>>>(key, 0, read_size as isize - 1).await {
+                            Ok(messages) => {
+                                local_bytes_read += messages.iter().map(|m: &Vec<u8>| m.len() as u64).sum::<u64>();
+                                process_read_result(messages, task_format, task_zero_copy_read, use_compression)
+                            },
                             Err(_) => false
                         }
                     };
@@ -327,7 +363,13 @@ async fn run_benchmark(
             if worker_progress_counter > 0 {
                 progress_bar_clone.inc(worker_progress_counter);
             }
-            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done }
+            WorkerResult { 
+                histogram: hist, 
+                errors: local_errors, 
+                ops_done: local_ops_done,
+                bytes_written: local_bytes_written,
+                bytes_read: local_bytes_read,
+            }
         }));
     }
 
@@ -343,6 +385,8 @@ async fn run_benchmark(
         Some(hdrhistogram::Histogram::<u64>::new(3).unwrap())
     } else { None };
     let mut total_errors = 0;
+    let mut total_bytes_written: u64 = 0;
+    let mut total_bytes_read: u64 = 0;
 
     for result in worker_results {
         match result {
@@ -351,6 +395,8 @@ async fn run_benchmark(
                     let _ = fh.add(wh);
                 }
                 total_errors += wr.errors;
+                total_bytes_written += wr.bytes_written;
+                total_bytes_read += wr.bytes_read;
             }
             Err(e) => {
                 eprintln!("Worker task panicked: {}", e);
@@ -373,34 +419,62 @@ async fn run_benchmark(
         else { (Some(0.0), Some(0.0)) }
     } else { (None, None) };
 
-    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors })
+    Ok(BenchResult {
+        ops_per_second,
+        total_time,
+        avg_latency_ms: avg_lat,
+        p99_latency_ms: p99_lat,
+        errors: total_errors,
+        total_bytes_written,
+        total_bytes_read,
+    })
 }
 
-fn process_read_result(messages: Vec<Vec<u8>>, format: DataFormat, zero_copy: bool) -> bool {
+fn process_read_result(messages: Vec<Vec<u8>>, format: DataFormat, zero_copy: bool, compressed: bool) -> bool {
     if messages.is_empty() { return true; }
 
-    if zero_copy {
-        for bytes in &messages {
+    for bytes in &messages {
+        // Decompress first if needed. This is now a required step for all reads if compression is enabled.
+        let decompressed_result = if compressed {
+            decode_all(bytes.as_slice())
+        } else {
+            Ok(bytes.to_vec()) // Wrap in Ok for consistent matching
+        };
+
+        let owned_bytes = match decompressed_result {
+            Ok(b) => b,
+            Err(_) => return false, // Decompression failed
+        };
+
+        if zero_copy {
+            // "Zero-copy" in a compressed world means we decompress but avoid full deserialization.
+            // We can still do cheap checks on the decompressed data.
             let ok = if matches!(format, DataFormat::Rkyv) {
-                if let Ok(archived) = from_bytes::<BenchmarkPayload, RkyvError>(bytes) {
+                if let Ok(archived) = from_bytes::<BenchmarkPayload, RkyvError>(&owned_bytes) {
                     let _ = archived.id; // Simulate field access
                     true
-                } else { false }
+                } else {
+                    false
+                }
             } else {
-                true // For other formats, zero-copy means not processing the bytes
+                // For other formats, with zero_copy on, we just decompress and move on.
+                true
             };
             if !ok { return false; }
-        }
-    } else {
-        for bytes in &messages {
+        } else {
+            // Full deserialization path on decompressed data.
             let ok = match format {
-                DataFormat::Json => serde_json::from_slice::<BenchmarkPayload>(bytes).is_ok(),
-                DataFormat::Bitcode => bitcode::deserialize::<BenchmarkPayload>(bytes).is_ok(),
-                DataFormat::String => String::from_utf8(bytes.to_vec()).is_ok(),
-                DataFormat::Protobuf => pb::BenchmarkPayload::decode(bytes.as_slice()).is_ok(),
+                DataFormat::Json => serde_json::from_slice::<BenchmarkPayload>(&owned_bytes).is_ok(),
+                DataFormat::Bitcode => bitcode::deserialize::<BenchmarkPayload>(&owned_bytes).is_ok(),
+                DataFormat::String => String::from_utf8(owned_bytes).is_ok(),
+                DataFormat::Protobuf => pb::BenchmarkPayload::decode(owned_bytes.as_slice()).is_ok(),
                 DataFormat::Rkyv => {
-                    match from_bytes::<BenchmarkPayload, RkyvError>(bytes) {
+                    match from_bytes::<BenchmarkPayload, RkyvError>(&owned_bytes) {
                         Ok(archived) => {
+                            // For full deserialization, we can use the archived value directly
+                            // or just access a field to simulate usage
+                            let _ = &archived.data;
+                            let _ = archived.timestamp;
                             let _ = archived.id;
                             true
                         },
@@ -420,15 +494,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     println!("Configuration: Ops={}, Concurrency={}, Format={:?}, ValueBaseSize={}B", cli.num_ops, cli.concurrency, cli.format, cli.value_size);
     println!("Chat Simulation: Chats={}, HistoryLen={}, ReadSize={}", cli.num_chats, cli.history_len, cli.read_size);
-    println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, ZeroCopyRead={}", cli.pipeline, cli.batch_size, cli.no_latency, cli.zero_copy_read);
+    println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, ZeroCopyRead={}, Compression={}", cli.pipeline, cli.batch_size, cli.no_latency, cli.zero_copy_read, if cli.compress_zstd {"zstd"} else {"none"});
     println!("Ensure Redis is running on {} and Valkey on {}", cli.redis_url, cli.valkey_url);
 
     if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
 
     let benchmarks_to_run = match (cli.write_only, cli.read_only) {
         (true, false) => vec!["WRITE"],
-        (false, true) => vec!["READ"],
-        (false, false) => vec!["WRITE", "READ"],
+        (false, true) => vec!["read"],
+        (false, false) => vec!["WRITE", "read"],
         (true, true) => { println!("Cannot specify both --write-only and --read-only."); return Ok(()); }
     };
 
@@ -437,7 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let write_data = PreGeneratedData::new(&cli, "WRITE");
     let read_data = PreGeneratedData { keys: Arc::clone(&write_data.keys), values: None };
 
-    if benchmarks_to_run.contains(&"READ") {
+    if benchmarks_to_run.contains(&"read") {
         let mut prepop_cli = cli.clone();
         prepop_cli.pipeline = true;
         prepop_cli.batch_size = cli.batch_size.max(200);
@@ -456,7 +530,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let actual_track_latency = track_latency_globally && !cli.pipeline;
 
             match run_benchmark(db_type, op_type_str_ref, url_string.as_str(), &cli, current_data, actual_track_latency).await {
-                Ok(result) => { results_table.push(( *db_type, *op_type_str_ref, result.ops_per_second, result.total_time.as_secs_f64(), result.avg_latency_ms, result.p99_latency_ms, result.errors )); },
+                Ok(result) => {
+                     results_table.push((
+                        *db_type,
+                        *op_type_str_ref,
+                        result.ops_per_second,
+                        result.total_time.as_secs_f64(),
+                        result.avg_latency_ms,
+                        result.p99_latency_ms,
+                        result.errors,
+                        result.total_bytes_written,
+                        result.total_bytes_read,
+                    ));
+                },
                 Err(e) => {
                     eprintln!("Error benchmarking {} {}: {}", db_type, op_type_str_ref, e);
                      match redis::Client::open(url_string.as_str()) {
@@ -478,27 +564,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\n--- Benchmark Summary (Format: {:?}, Workload: Chat Simulation) ---", cli.format);
+    println!("\n--- Benchmark Summary (Format: {:?}{}, Workload: Chat Simulation) ---", cli.format, if cli.compress_zstd { "+zstd" } else { "" });
     let show_latency_in_table = track_latency_globally && !cli.pipeline;
     if show_latency_in_table {
-        println!("{:<15} | {:<20} | {:<15} | {:<12} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Total Time(s)", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
-        println!("{:-<16}|{:-<22}|{:-<17}|{:-<14}|{:-<14}|{:-<14}|{:-<10}", "", "", "", "", "", "", "");
+        println!("{:<12} | {:<18} | {:<14} | {:<14} | {:<14} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
+        println!("{:-<13}|{:-<20}|{:-<16}|{:-<16}|{:-<16}|{:-<14}|{:-<14}|{:-<10}", "", "", "", "", "", "", "", "");
     } else {
-        println!("{:<15} | {:<20} | {:<15} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Total Time(s)", "Errors");
-        println!("{:-<16}|{:-<22}|{:-<17}|{:-<14}|{:-<10}", "", "", "", "", "");
+        println!("{:<12} | {:<18} | {:<14} | {:<14} | {:<14} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Errors");
+        println!("{:-<13}|{:-<20}|{:-<16}|{:-<16}|{:-<16}|{:-<10}", "", "", "", "", "", "");
     }
 
-    for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors) in results_table.iter() {
-        let op_name = if *op == "READ" {
+    for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, bytes_written, bytes_read) in results_table.iter() {
+        let op_name = if *op == "read" {
             if cli.zero_copy_read { "READ (Chat, ZC)".to_string() } else { "READ (Chat)".to_string() }
         } else {
             "WRITE (Chat)".to_string()
         };
 
+        let total_traffic_bytes = *bytes_written + *bytes_read;
+        let traffic_speed_mb_s = if *time_s > 0.0 {
+            (total_traffic_bytes as f64 / *time_s) / 1_000_000.0
+        } else { 0.0 };
+        let total_traffic_str = Byte::from(total_traffic_bytes).get_appropriate_unit(UnitType::Binary).to_string();
+
         if show_latency_in_table {
-            println!("{:<15} | {:<20} | {:<15.2} | {:<12.3} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, ops_sec, time_s, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
+            println!("{:<12} | {:<18} | {:<14.2} | {:<14.2} | {:<14} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, ops_sec, traffic_speed_mb_s, total_traffic_str, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
         } else {
-            println!("{:<15} | {:<20} | {:<15.2} | {:<12.3} | {:<8}", db, op_name, ops_sec, time_s, errors);
+            println!("{:<12} | {:<18} | {:<14.2} | {:<14.2} | {:<14} | {:<8}", db, op_name, ops_sec, traffic_speed_mb_s, total_traffic_str, errors);
         }
     }
 

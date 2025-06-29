@@ -20,6 +20,7 @@ prost-build = "0.12"
 # CORRECTED: Enable the `alloc` feature for rkyv to support heap-allocated types
 rkyv = { version = "0.8.10", features = ["alloc"] }
 rkyv_derive = "0.8.10"
+skytable = "0.8"
 zstd = "0.13.1"
 
 [profile.maxperf]

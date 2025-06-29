@@ -9,7 +9,7 @@ services:
       - "6379:6379"
     # Command to disable persistence for benchmark focus (optional)
     # This makes it faster but data is lost on restart if not explicitly saved.
-    command: redis-server --save "" --appendonly no
+    command: redis-server --save "" --appendonly no --io-threads 8 --io-threads-do-reads no
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -23,7 +23,7 @@ services:
     ports:
       - "6380:6379" # Valkey internally listens on 6379, map to host 6380
     # Command to disable persistence for benchmark focus (optional)
-    command: valkey-server --save "" --appendonly no
+    command: valkey-server --save "" --appendonly no --io-threads 8 --io-threads-do-reads no
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 1s

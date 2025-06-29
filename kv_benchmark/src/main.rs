@@ -1,5 +1,6 @@
 use byte_unit::{Byte, UnitType};
 use clap::{Parser, ValueEnum};
+use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng, SeedableRng};
 use redis::AsyncCommands;
@@ -7,9 +8,9 @@ use rkyv::{
     from_bytes, rancor::Error as RkyvError, to_bytes, Archive, Deserialize as RkyvDeserialize,
     Serialize as RkyvSerialize,
 };
-use rkyv::Deserialize;
 // use serde::{Deserialize, Serialize};
 use serde::{Deserialize as SerdeDeserialize, Serialize};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zstd::stream::{decode_all, encode_all};
@@ -73,6 +74,12 @@ struct Cli {
     #[clap(long, help = "Run only read benchmarks")]
     read_only: bool,
 
+    #[clap(long, help = "Run only Pub/Sub benchmarks")]
+    pubsub_only: bool,
+
+    #[clap(long, help = "For Pub/Sub: number of publisher clients", default_value_t = 1)]
+    num_publishers: usize,
+
     #[clap(long, help = "Use explicit pipelining for commands")]
     pipeline: bool,
 
@@ -117,7 +124,7 @@ impl PreGeneratedData {
         let mut rng = rand::thread_rng();
         println!(
             "Pre-generating {} chat room keys and potentially {} message values (base size {}B) using {:?} format...",
-            cli.num_chats, if op_type_for_values == "WRITE" { cli.num_ops } else { 0 }, cli.value_size, cli.format
+            cli.num_chats, if op_type_for_values == "WRITE" || op_type_for_values == "PUBSUB" { cli.num_ops } else { 0 }, cli.value_size, cli.format
         );
 
         let keys = Arc::new(
@@ -126,7 +133,7 @@ impl PreGeneratedData {
                 .collect::<Vec<_>>(),
         );
 
-        let values = if op_type_for_values == "WRITE" {
+        let values = if op_type_for_values == "WRITE" || op_type_for_values == "PUBSUB" {
             let values_bytes: Vec<Vec<u8>> = (0..cli.num_ops).map(|i| {
                 let random_data = generate_random_string(cli.value_size, &mut rng);
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -185,7 +192,6 @@ struct BenchResult {
     p99_latency_ms: Option<f64>,
     errors: usize,
     total_bytes_written: u64,
-    // CORRECTED: Typo u664 -> u64
     total_bytes_read: u64,
 }
 
@@ -196,6 +202,240 @@ struct WorkerResult {
     bytes_written: u64,
     bytes_read: u64,
 }
+
+async fn run_pubsub_benchmark(
+    db_name: &str,
+    db_url_slice: &str,
+    cli: &Cli,
+    data: &PreGeneratedData,
+    track_latency: bool,
+) -> Result<BenchResult, Box<dyn std::error::Error>> {
+    let num_publishers = cli.num_publishers;
+    let num_subscribers = cli.concurrency.saturating_sub(num_publishers);
+
+    if num_subscribers == 0 {
+        return Err("Pub/Sub benchmark requires at least one subscriber. Adjust --concurrency or --num-publishers.".into());
+    }
+    if num_publishers == 0 {
+        return Err("Pub/Sub benchmark requires at least one publisher. Adjust --num-publishers.".into());
+    }
+
+    let op_type = "PUBSUB";
+    println!(
+        "\nBenchmarking {} {} ({} publishers, {} subscribers, {} ops total, {:?}{} format)...",
+        db_name,
+        op_type,
+        num_publishers,
+        num_subscribers,
+        cli.num_ops,
+        cli.format,
+        if cli.compress_zstd { "+zstd" } else { "" },
+    );
+
+    let client = redis::Client::open(db_url_slice)?;
+
+    let pb = ProgressBar::new(cli.num_ops as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .expect("Failed to create progress bar style")
+            .progress_chars("#>-"),
+    );
+    pb.set_message(format!("{} {}", db_name, op_type));
+    let pb_arc = Arc::new(pb);
+
+    // --- Coordination Primitives ---
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let ready_barrier = Arc::new(tokio::sync::Barrier::new(num_subscribers + 1));
+    let received_msg_count = Arc::new(AtomicUsize::new(0));
+    let received_bytes_count = Arc::new(AtomicU64::new(0));
+
+    // --- Subscriber Tasks ---
+    let mut sub_tasks = Vec::with_capacity(num_subscribers);
+    for _ in 0..num_subscribers {
+        let sub_client = client.clone();
+        let barrier = ready_barrier.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let msg_count = received_msg_count.clone();
+        let bytes_count = received_bytes_count.clone();
+        let channel_pattern = format!("{}:*", DEFAULT_KEY_PREFIX);
+
+        sub_tasks.push(tokio::spawn(async move {
+            // FIX: Use the fully async pubsub API
+            let mut pubsub = match sub_client.get_async_pubsub().await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[Subscriber Error] Failed to connect: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = pubsub.psubscribe(&channel_pattern).await {
+                eprintln!("[Subscriber Error] Failed to psubscribe to '{}': {}", channel_pattern, e);
+                return;
+            }
+
+            // Signal that this subscriber is ready
+            barrier.wait().await;
+
+            // The on_message() method on an aio::PubSub returns a stream.
+            let mut message_stream = pubsub.on_message();
+
+            loop {
+                tokio::select! {
+                    biased; // Give priority to the shutdown signal to exit quickly.
+                    _ = shutdown_rx.recv() => {
+                        break; // Shutdown signal received from main thread.
+                    },
+                    Some(msg) = message_stream.next() => {
+                        let payload: &[u8] = msg.get_payload_bytes();
+                        msg_count.fetch_add(1, Ordering::Relaxed);
+                        bytes_count.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    },
+                    else => {
+                        // The stream is exhausted. This usually means the connection
+                        // was closed.
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+
+    // --- Wait for subscribers to be ready ---
+    ready_barrier.wait().await;
+    let start_time = Instant::now();
+
+    // --- Publisher Tasks ---
+    let mut pub_tasks = Vec::with_capacity(num_publishers);
+    let ops_per_publisher = (cli.num_ops + num_publishers - 1) / num_publishers;
+
+    for worker_id in 0..num_publishers {
+        let mut conn = client.get_multiplexed_async_connection().await?;
+        let keys_ref = Arc::clone(&data.keys);
+        let values_ref = data.values.as_ref().unwrap().clone();
+        let progress_bar_clone = pb_arc.clone();
+
+        let worker_start_idx = worker_id * ops_per_publisher;
+        let worker_end_idx = ((worker_id + 1) * ops_per_publisher).min(cli.num_ops);
+        if worker_start_idx >= worker_end_idx { continue; }
+
+        pub_tasks.push(tokio::spawn(async move {
+            let mut hist = if track_latency { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
+            let mut local_errors: usize = 0;
+            let mut local_ops_done: usize = 0;
+            let mut local_bytes_written: u64 = 0;
+            let mut worker_progress_counter: u64 = 0;
+            let num_worker_ops = worker_end_idx - worker_start_idx;
+            let mut rng = StdRng::from_entropy();
+
+            for i in 0..num_worker_ops {
+                let op_idx = worker_start_idx + i;
+                let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
+                let value = &values_ref[op_idx];
+                
+                let op_start_time = if track_latency { Some(Instant::now()) } else { None };
+
+                match conn.publish::<&str, &[u8], ()>(key, value).await {
+                    Ok(_) => {
+                        local_ops_done += 1;
+                        local_bytes_written += value.len() as u64;
+                    },
+                    Err(_) => {
+                        local_errors += 1;
+                    }
+                }
+
+                if let Some(st) = op_start_time {
+                    if let Some(h) = hist.as_mut() { h.record(st.elapsed().as_micros() as u64).unwrap(); }
+                }
+
+                worker_progress_counter += 1;
+                if worker_progress_counter >= PROGRESS_UPDATE_INTERVAL as u64 {
+                    progress_bar_clone.inc(worker_progress_counter);
+                    worker_progress_counter = 0;
+                }
+            }
+
+            if worker_progress_counter > 0 {
+                progress_bar_clone.inc(worker_progress_counter);
+            }
+            WorkerResult { 
+                histogram: hist, 
+                errors: local_errors, 
+                ops_done: local_ops_done,
+                bytes_written: local_bytes_written,
+                bytes_read: 0, // Publishers don't read
+            }
+        }));
+    }
+
+    let publisher_results = futures::future::join_all(pub_tasks).await;
+    let total_time = start_time.elapsed();
+    
+    let _ = shutdown_tx.send(()); // Tell subscribers to stop
+    
+    if pb_arc.position() < cli.num_ops as u64 && cli.num_ops > 0 {
+        pb_arc.set_position(cli.num_ops as u64);
+    }
+    pb_arc.finish_with_message(format!("{} {} Done", db_name, op_type));
+
+    let _ = futures::future::join_all(sub_tasks).await;
+
+    // --- Aggregate publisher results ---
+    let mut final_histogram = if track_latency { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
+    let mut total_errors = 0;
+    let mut total_bytes_written: u64 = 0;
+
+    for result in publisher_results {
+        match result {
+            Ok(wr) => {
+                if let (Some(fh), Some(wh)) = (final_histogram.as_mut(), wr.histogram.as_ref()) {
+                    let _ = fh.add(wh);
+                }
+                total_errors += wr.errors;
+                total_bytes_written += wr.bytes_written;
+            }
+            Err(e) => {
+                eprintln!("Publisher task panicked: {}", e);
+                total_errors += cli.num_ops / num_publishers.max(1);
+            }
+        }
+    }
+    
+    let total_bytes_read = received_bytes_count.load(Ordering::SeqCst);
+    let total_msgs_received = received_msg_count.load(Ordering::SeqCst);
+
+    let successful_ops = cli.num_ops.saturating_sub(total_errors);
+    let ops_per_second = if total_time.as_secs_f64() > 0.0 {
+        successful_ops as f64 / total_time.as_secs_f64()
+    } else { if successful_ops > 0 { f64::INFINITY } else { 0.0 } };
+    
+    let received_msgs_per_sec = if total_time.as_secs_f64() > 0.0 {
+        total_msgs_received as f64 / total_time.as_secs_f64()
+    } else { 0.0 };
+
+    println!(
+        "Publisher throughput: {:.2} ops/sec. Messages distributed: {} ({:.2} msgs/sec).",
+        ops_per_second, total_msgs_received, received_msgs_per_sec
+    );
+
+    let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() {
+        if hist.len() > 0 { (Some(hist.mean() as f64 / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) }
+        else { (Some(0.0), Some(0.0)) }
+    } else { (None, None) };
+    
+    Ok(BenchResult {
+        ops_per_second,
+        total_time,
+        avg_latency_ms: avg_lat,
+        p99_latency_ms: p99_lat,
+        errors: total_errors,
+        total_bytes_written,
+        total_bytes_read,
+    })
+}
+
 
 async fn run_benchmark(
     db_name: &str,
@@ -492,55 +732,79 @@ fn process_read_result(messages: Vec<Vec<u8>>, format: DataFormat, zero_copy: bo
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let track_latency_globally = !cli.no_latency;
+
     println!("Configuration: Ops={}, Concurrency={}, Format={:?}, ValueBaseSize={}B", cli.num_ops, cli.concurrency, cli.format, cli.value_size);
-    println!("Chat Simulation: Chats={}, HistoryLen={}, ReadSize={}", cli.num_chats, cli.history_len, cli.read_size);
+    if cli.pubsub_only {
+        println!("Pub/Sub mode: Publishers={}", cli.num_publishers);
+    } else {
+        println!("Chat Simulation: Chats={}, HistoryLen={}, ReadSize={}", cli.num_chats, cli.history_len, cli.read_size);
+    }
     println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, ZeroCopyRead={}, Compression={}", cli.pipeline, cli.batch_size, cli.no_latency, cli.zero_copy_read, if cli.compress_zstd {"zstd"} else {"none"});
     println!("Ensure Redis is running on {} and Valkey on {}", cli.redis_url, cli.valkey_url);
 
     if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
 
-    let benchmarks_to_run = match (cli.write_only, cli.read_only) {
-        (true, false) => vec!["WRITE"],
-        (false, true) => vec!["read"],
-        (false, false) => vec!["WRITE", "read"],
-        (true, true) => { println!("Cannot specify both --write-only and --read-only."); return Ok(()); }
+    let benchmarks_to_run = match (cli.write_only, cli.read_only, cli.pubsub_only) {
+        (true, false, false) => vec!["WRITE"],
+        (false, true, false) => vec!["READ"],
+        (false, false, true) => vec!["PUBSUB"],
+        (false, false, false) => vec!["WRITE", "READ"],
+        _ => {
+            eprintln!("Error: Please specify at most one of --write-only, --read-only, or --pubsub-only.");
+            return Ok(());
+        }
     };
 
-    let track_latency_globally = !cli.no_latency;
+    let op_for_data_gen = if benchmarks_to_run.contains(&"PUBSUB") { "PUBSUB" } else { "WRITE" };
+    let data = PreGeneratedData::new(&cli, op_for_data_gen);
+    
+    let read_data_keys = if benchmarks_to_run.contains(&"READ") {
+        Some(PreGeneratedData { keys: Arc::clone(&data.keys), values: None })
+    } else {
+        None
+    };
 
-    let write_data = PreGeneratedData::new(&cli, "WRITE");
-    let read_data = PreGeneratedData { keys: Arc::clone(&write_data.keys), values: None };
-
-    if benchmarks_to_run.contains(&"read") {
+    if benchmarks_to_run.contains(&"READ") {
         let mut prepop_cli = cli.clone();
         prepop_cli.pipeline = true;
         prepop_cli.batch_size = cli.batch_size.max(200);
 
         println!("\nINFO: Pre-populating Redis for READ benchmark...");
-        run_benchmark("Redis-PrePop", "WRITE", &cli.redis_url, &prepop_cli, &write_data, false).await?;
+        run_benchmark("Redis-PrePop", "WRITE", &cli.redis_url, &prepop_cli, &data, false).await?;
         println!("\nINFO: Pre-populating Valkey for READ benchmark...");
-        run_benchmark("Valkey-PrePop", "WRITE", &cli.valkey_url, &prepop_cli, &write_data, false).await?;
+        run_benchmark("Valkey-PrePop", "WRITE", &cli.valkey_url, &prepop_cli, &data, false).await?;
     }
 
     let mut results_table = Vec::new();
     for db_type in &["Redis", "Valkey"] {
         let url_string = if *db_type == "Redis" { &cli.redis_url } else { &cli.valkey_url };
         for op_type_str_ref in &benchmarks_to_run {
-            let current_data = if *op_type_str_ref == "WRITE" { &write_data } else { &read_data };
             let actual_track_latency = track_latency_globally && !cli.pipeline;
 
-            match run_benchmark(db_type, op_type_str_ref, url_string.as_str(), &cli, current_data, actual_track_latency).await {
-                Ok(result) => {
+            let result = if *op_type_str_ref == "PUBSUB" {
+                run_pubsub_benchmark(db_type, url_string.as_str(), &cli, &data, !cli.no_latency).await
+            } else {
+                let current_data = if *op_type_str_ref == "WRITE" {
+                    &data
+                } else {
+                    read_data_keys.as_ref().unwrap()
+                };
+                run_benchmark(db_type, op_type_str_ref, url_string.as_str(), &cli, current_data, actual_track_latency).await
+            };
+            
+            match result {
+                Ok(res) => {
                      results_table.push((
                         *db_type,
                         *op_type_str_ref,
-                        result.ops_per_second,
-                        result.total_time.as_secs_f64(),
-                        result.avg_latency_ms,
-                        result.p99_latency_ms,
-                        result.errors,
-                        result.total_bytes_written,
-                        result.total_bytes_read,
+                        res.ops_per_second,
+                        res.total_time.as_secs_f64(),
+                        res.avg_latency_ms,
+                        res.p99_latency_ms,
+                        res.errors,
+                        res.total_bytes_written,
+                        res.total_bytes_read,
                     ));
                 },
                 Err(e) => {
@@ -564,7 +828,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\n--- Benchmark Summary (Format: {:?}{}, Workload: Chat Simulation) ---", cli.format, if cli.compress_zstd { "+zstd" } else { "" });
+    let summary_workload = if cli.pubsub_only { "Pub/Sub" } else { "Chat Simulation" };
+    println!("\n--- Benchmark Summary (Format: {:?}{}, Workload: {}) ---", cli.format, if cli.compress_zstd { "+zstd" } else { "" }, summary_workload);
     let show_latency_in_table = track_latency_globally && !cli.pipeline;
     if show_latency_in_table {
         println!("{:<12} | {:<18} | {:<14} | {:<14} | {:<14} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
@@ -575,8 +840,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, bytes_written, bytes_read) in results_table.iter() {
-        let op_name = if *op == "read" {
+        let op_name = if *op == "READ" {
             if cli.zero_copy_read { "READ (Chat, ZC)".to_string() } else { "READ (Chat)".to_string() }
+        } else if *op == "PUBSUB" {
+            format!("PUBSUB ({} Pubs)", cli.num_publishers)
         } else {
             "WRITE (Chat)".to_string()
         };

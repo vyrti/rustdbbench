@@ -16,12 +16,12 @@ serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
 bitcode = { version = "0.5.0", features = ["serde"] }
 prost = "0.12.3"
-prost-build = "0.12"
 # CORRECTED: Enable the `alloc` feature for rkyv to support heap-allocated types
 rkyv = { version = "0.8.10", features = ["alloc"] }
 rkyv_derive = "0.8.10"
 skytable = "0.8"
 zstd = "0.13.1"
+flatbuffers = "24.3.25" # Add flatbuffers runtime
 
 [profile.maxperf]
 inherits = "release"
@@ -33,3 +33,4 @@ debug = 0
 
 [build-dependencies]
 prost-build = "0.12.3"
+flatc-rust = "0.2.0"

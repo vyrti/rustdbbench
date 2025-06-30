@@ -1,0 +1,10 @@
+// FlatBuffers schema definition for the benchmark payload.
+namespace benchmark_fbs;
+
+table BenchmarkPayload {
+  data: string;
+  timestamp: ulong;
+  id: ulong;
+}
+
+root_type BenchmarkPayload;

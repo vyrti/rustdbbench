@@ -4,7 +4,8 @@ use byte_unit::{Byte, UnitType};
 use clap::{Parser, ValueEnum};
 use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng, SeedableRng};
+use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng}; // Corrected: prelude::* and removed redundant SeedableRng
+// Removed: use rand::Rng; // Redundant after importing rand::prelude::*
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use rkyv::{
     access, // Used for validation/deserialization with `Archived`
@@ -407,6 +408,7 @@ async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data
                     _ = shutdown_rx.recv() => break,
                     Some(msg) = message_stream.next() => {
                         msg_count.fetch_add(1, Ordering::Relaxed);
+                        // In Redis, `get_payload_bytes()` returns `Vec<u8>`, which is already a copy from the network buffer.
                         bytes_count.fetch_add(msg.get_payload_bytes().len() as u64, Ordering::Relaxed);
                     },
                     else => break,
@@ -461,11 +463,12 @@ async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data
             total_bytes_written += wr.bytes_written;
         }
     }
-    let total_bytes_read = received_bytes_count.load(Ordering::SeqCst);
+    let total_bytes_read_raw = received_bytes_count.load(Ordering::SeqCst); 
+
     let successful_ops = cli.num_ops.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
-    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_bytes_written, total_bytes_read })
+    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_bytes_written, total_bytes_read: total_bytes_read_raw })
 }
 
 async fn run_internal_pubsub_benchmark(
@@ -513,7 +516,7 @@ async fn run_internal_pubsub_benchmark(
         let bytes_count = received_bytes_count.clone();
         let barrier = ready_barrier.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
-        let cli_format = cli.format;
+        // Removed cli_format and cli_compress_zstd as they are no longer used here.
 
         sub_tasks.push(tokio::spawn(async move {
             let (tx, mut rx) = mpsc::channel::<SharedBytes>(256);
@@ -530,8 +533,10 @@ async fn run_internal_pubsub_benchmark(
                     Some(msg_arc) = rx.recv() => {
                         msg_count.fetch_add(1, Ordering::Relaxed);
                         bytes_count.fetch_add(msg_arc.len() as u64, Ordering::Relaxed);
-                        // Process message based on format to simulate read/deserialization cost.
-                        let _ = process_read_result_simple((*msg_arc).to_vec(), cli_format, false);
+                        // REMOVED: Processing/deserialization on the subscriber side
+                        // This makes the internal Pub/Sub comparable to Redis's, which doesn't include
+                        // deserialization in its reported Pub/Sub performance.
+                        // let _ = process_read_result_simple(&msg_arc, cli_format, cli_compress_zstd);
                     },
                     else => break,
                 }
@@ -615,6 +620,7 @@ async fn run_internal_pubsub_benchmark(
                 let op_start_time = if track_latency { Some(Instant::now()) } else { None };
 
                 if let Some(subscribers) = subs_clone.get(key) {
+                    // Total bytes written should account for bytes sent to *all* subscribers
                     local_bytes_written += (value_bytes.len() * subscribers.len()) as u64;
                     for sender in subscribers.iter() {
                         if sender.send(value_bytes.clone()).await.is_err() {}
@@ -691,7 +697,7 @@ async fn run_internal_pubsub_benchmark(
 async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + Send + Sync>, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
     let op_type_owned = op_type_ref.to_string();
     let _mode_str = if cli.pipeline { "PIPELINED" } else { "INDIVIDUAL" };
-    let zero_copy_description = if op_type_owned == "READ" && matches!(cli.format, DataFormat::Rkyv | DataFormat::Flatbuffers) { " (Zero-Copy)" } else { "" };
+    let zero_copy_description = if op_type_owned == "READ" && matches!(cli.format, DataFormat::Rkyv | DataFormat::Flatbuffers) { " (Zero-Copy Deserialization)" } else { "" };
     println!("\nBenchmarking {} {} ({:?} workload){}{}...", db_name, op_type_owned, cli.workload, zero_copy_description, if op_type_owned == "READ" && cli.workload == Workload::Chat { format!(" READ_SIZE: {}", cli.read_size) } else { "".to_string() });
     let pb = ProgressBar::new(cli.num_ops as u64);
     pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}").unwrap().progress_chars("#>-"));
@@ -739,7 +745,7 @@ async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + S
                         } else {
                             let keys = (0..current_batch_size).map(|i| { let op_idx = worker_start_idx + chunk_start_offset + i; keys_ref[op_idx].as_str() }).collect();
                             match db_clone.batch_get(keys).await {
-                                Ok(results) => { local_bytes_read += results.iter().map(|b| b.len() as u64).sum::<u64>(); for bytes in results { if !process_read_result_simple(bytes, cli_clone.format, cli_clone.compress_zstd) { local_errors += 1; } } Ok(()) },
+                                Ok(results) => { local_bytes_read += results.iter().map(|b| b.len() as u64).sum::<u64>(); for bytes in results { if !process_read_result_simple(&bytes, cli_clone.format, cli_clone.compress_zstd) { local_errors += 1; } } Ok(()) },
                                 Err(e) => { local_errors += current_batch_size; Err(e) }
                             }
                         }
@@ -761,7 +767,7 @@ async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + S
                         Workload::Simple => {
                             let key = &keys_ref[op_idx];
                             if task_op_type == "WRITE" { let value = values_ref.as_ref().unwrap()[op_idx].clone(); local_bytes_written += value.len() as u64; db_clone.set(key.clone(), value).await.is_ok() }
-                            else { match db_clone.get(key).await { Ok(Some(bytes)) => { local_bytes_read += bytes.len() as u64; process_read_result_simple(bytes, cli_clone.format, cli_clone.compress_zstd) }, Ok(None) => true, Err(_) => false, } }
+                            else { match db_clone.get(key).await { Ok(Some(bytes)) => { local_bytes_read += bytes.len() as u64; process_read_result_simple(&bytes, cli_clone.format, cli_clone.compress_zstd) }, Ok(None) => true, Err(_) => false, } }
                         }
                     };
                     if let Some(st) = op_start_time { if let Some(h) = hist.as_mut() { h.record(st.elapsed().as_micros() as u64).unwrap(); } }
@@ -796,25 +802,43 @@ async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + S
 }
 
 fn process_read_result_chat(messages: Vec<Vec<u8>>, format: DataFormat, compressed: bool) -> bool {
-    messages.into_iter().all(|bytes| process_read_result_simple(bytes, format, compressed))
+    // For `Vec<Vec<u8>>`, we iterate and pass a slice to `process_read_result_simple`.
+    messages.into_iter().all(|bytes_vec| process_read_result_simple(bytes_vec.as_slice(), format, compressed))
 }
 
-fn process_read_result_simple(bytes: Vec<u8>, format: DataFormat, compressed: bool) -> bool {
-    if bytes.is_empty() { return true; }
-    let owned_bytes = if compressed {
-        // Handle decompression errors
-        match decode_all(bytes.as_slice()) {
-            Ok(decompressed) => decompressed,
+// This function now takes a slice `&[u8]` as input.
+// For Rkyv, Flatbuffers, and Protobuf, if `compressed` is false, this can be truly zero-copy as it operates directly on the slice.
+// For other formats (String, Json, Bitcode) or if `compressed` is true, an internal copy or allocation will still occur.
+fn process_read_result_simple(bytes_slice: &[u8], format: DataFormat, compressed: bool) -> bool {
+    if bytes_slice.is_empty() { return true; }
+    
+    let final_bytes_slice: &[u8];
+    let owned_decompressed_vec: Vec<u8>; // New variable to hold owned data if decompressed
+
+    if compressed {
+        match decode_all(bytes_slice) {
+            Ok(decompressed) => {
+                owned_decompressed_vec = decompressed; // Move the decompressed data into this var
+                final_bytes_slice = &owned_decompressed_vec; // Reference it
+            },
             Err(_) => return false, // Decompression failed
         }
-    } else { bytes };
+    } else {
+        final_bytes_slice = bytes_slice; // Directly use the input slice if not compressed
+    }
+
     match format {
-        DataFormat::Rkyv => access::<Archived<BenchmarkPayload>, RkyvError>(&owned_bytes).map(|_| true).unwrap_or(false), // Uses `access` for validation
-        DataFormat::Flatbuffers => flatbuffers::root::<fbs::benchmark_fbs::BenchmarkPayload>(&owned_bytes).is_ok(),
-        DataFormat::Json => serde_json::from_slice::<BenchmarkPayload>(&owned_bytes).is_ok(),
-        DataFormat::Bitcode => bitcode::deserialize::<BenchmarkPayload>(&owned_bytes).is_ok(),
-        DataFormat::String => String::from_utf8(owned_bytes).is_ok(),
-        DataFormat::Protobuf => pb::BenchmarkPayload::decode(owned_bytes.as_slice()).is_ok(),
+        // These formats can potentially be "zero-copy" from the `bytes_slice` if not compressed.
+        // They operate on `&[u8]` directly.
+        DataFormat::Rkyv => access::<Archived<BenchmarkPayload>, RkyvError>(final_bytes_slice).map(|_| true).unwrap_or(false),
+        DataFormat::Flatbuffers => flatbuffers::root::<fbs::benchmark_fbs::BenchmarkPayload>(final_bytes_slice).is_ok(),
+        DataFormat::Protobuf => pb::BenchmarkPayload::decode(final_bytes_slice).is_ok(),
+
+        // These formats typically require an owned `Vec<u8>` or internal copying.
+        // `to_vec()` creates a copy.
+        DataFormat::Json => serde_json::from_slice::<BenchmarkPayload>(final_bytes_slice).is_ok(),
+        DataFormat::Bitcode => bitcode::deserialize::<BenchmarkPayload>(final_bytes_slice).is_ok(),
+        DataFormat::String => String::from_utf8(final_bytes_slice.to_vec()).is_ok(),
     }
 }
 

@@ -21,6 +21,10 @@ use zstd::stream::{decode_all, encode_all};
 
 use bitcode;
 use prost::Message;
+// NOTE: Custom client dependencies are no longer needed
+// use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+// use tokio::net::TcpStream;
+// use tokio::sync::Mutex as TokioMutex;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/benchmark.rs"));
@@ -47,7 +51,7 @@ enum Workload {
 
 #[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
 enum DbChoice {
-    Redis, Valkey, InMemory,
+    Redis, Valkey, InMemory, RustDb,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -59,6 +63,8 @@ struct Cli {
     redis_url: String,
     #[clap(short, long, default_value = "redis://127.0.0.1:6380")]
     valkey_url: String,
+    #[clap(long, default_value = "redis://127.0.0.1:7878", help="URL for the custom Rust Redis server.")]
+    rustdb_url: String,
     #[clap(long, value_enum, default_value_t = Workload::Chat, help = "The type of benchmark workload to run.")]
     workload: Workload,
     #[clap(short = 'o', long, default_value_t = 100_000, help="Total number of operations to perform.")]
@@ -215,6 +221,7 @@ impl KvStore for InMemoryStore {
 }
 
 // --- Redis Implementation of the Trait ---
+// NOTE: This single implementation now works for Redis, Valkey, and our RustDb server!
 #[derive(Clone)]
 struct RedisStore {
     conn: MultiplexedConnection,
@@ -289,6 +296,8 @@ impl KvStore for RedisStore {
     }
 }
 
+// NOTE: RustDbStore has been removed entirely.
+
 // --- Data Generation & Other Structs ---
 fn generate_random_string(len: usize, rng: &mut impl Rng) -> String {
     let mut s = String::with_capacity(len);
@@ -362,6 +371,7 @@ struct WorkerResult {
 }
 
 async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
+    // ... (this function remains unchanged)
     let num_publishers = cli.num_publishers;
     let num_subscribers = cli.concurrency.saturating_sub(num_publishers);
     if num_subscribers == 0 { return Err(anyhow::anyhow!("Pub/Sub benchmark requires at least one subscriber.")); }
@@ -457,6 +467,7 @@ async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data
 }
 
 async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + Send + Sync>, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
+    // ... (this function remains unchanged)
     let op_type_owned = op_type_ref.to_string();
     let _mode_str = if cli.pipeline { "PIPELINED" } else { "INDIVIDUAL" };
     let zero_copy_description = if op_type_owned == "READ" && matches!(cli.format, DataFormat::Rkyv | DataFormat::Flatbuffers) { " (Zero-Copy)" } else { "" };
@@ -591,10 +602,10 @@ async fn main() -> Result<()> {
     println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, Compression={}", cli.pipeline, cli.batch_size, cli.no_latency, if cli.compress_zstd {"zstd"} else {"none"});
     
     if cli.db != DbChoice::InMemory {
-        println!("Ensure Redis is running on {} and Valkey on {}", cli.redis_url, cli.valkey_url);
+        println!("Ensure Redis ({}), Valkey ({}), and RustDb ({}) are running", cli.redis_url, cli.valkey_url, cli.rustdb_url);
     }
-    if cli.pubsub_only && cli.db == DbChoice::InMemory {
-        println!("\nPub/Sub benchmark is not supported for the in-memory database. Please use Redis or Valkey.");
+    if cli.pubsub_only && (cli.db == DbChoice::InMemory || cli.db == DbChoice::RustDb) {
+        println!("\nPub/Sub benchmark is not supported for {:?}. Please use Redis or Valkey.", cli.db);
         return Ok(());
     }
 
@@ -620,6 +631,7 @@ async fn main() -> Result<()> {
             DbChoice::Redis => Box::new(RedisStore::new(&cli.redis_url).await?),
             DbChoice::Valkey => Box::new(RedisStore::new(&cli.valkey_url).await?),
             DbChoice::InMemory => Box::new(InMemoryStore::new()),
+            DbChoice::RustDb => Box::new(RedisStore::new(&cli.rustdb_url).await?),
         };
 
         if benchmarks_to_run.contains(&"READ") {
@@ -634,7 +646,14 @@ async fn main() -> Result<()> {
         for op_type_str_ref in &benchmarks_to_run {
             let actual_track_latency = track_latency_globally && !cli.pipeline;
             let result = if *op_type_str_ref == "PUBSUB" {
-                let url = if db_choice == DbChoice::Redis { &cli.redis_url } else { &cli.valkey_url };
+                let url = match db_choice {
+                    DbChoice::Redis => &cli.redis_url,
+                    DbChoice::Valkey => &cli.valkey_url,
+                    _ => {
+                        eprintln!("FATAL: PUBSUB is not supported for {:?}", db_choice);
+                        continue;
+                    }
+                };
                 run_pubsub_benchmark(&db_name, url, &cli, &data, !cli.no_latency).await
             } else {
                 let current_data = if *op_type_str_ref == "WRITE" { &data } else { &PreGeneratedData { keys: Arc::clone(&data.keys), values: None } };

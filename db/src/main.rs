@@ -7,11 +7,14 @@ use futures::SinkExt;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::{debug, error, info, instrument};
 use rustc_hash::FxHashMap;
+
+// --- Use parking_lot::RwLock for high-performance concurrent reads ---
+use parking_lot::RwLock;
 
 //================================================================
 // Command Line Interface
@@ -40,26 +43,29 @@ pub trait KvStore: Send + Sync {
 }
 
 type ListValue = SmallVec<[Bytes; 8]>;
-const IN_MEMORY_SHARDS: usize = 256; // Increased shards slightly
+const IN_MEMORY_SHARDS: usize = 256; // Must be a power of two
 
 #[derive(Clone)]
 pub struct InMemoryStore {
-    shards: Arc<Vec<StdMutex<FxHashMap<Bytes, ListValue>>>>,
+    shards: Arc<Vec<RwLock<FxHashMap<Bytes, ListValue>>>>,
 }
 
 impl InMemoryStore {
     pub fn new() -> Self {
+        assert!(IN_MEMORY_SHARDS.is_power_of_two(), "Shard count must be a power of two");
         let mut shards = Vec::with_capacity(IN_MEMORY_SHARDS);
         for _ in 0..IN_MEMORY_SHARDS {
-            shards.push(StdMutex::new(FxHashMap::default()));
+            shards.push(RwLock::new(FxHashMap::default()));
         }
         Self { shards: Arc::new(shards) }
     }
 
+    #[inline]
     fn get_shard_index<K: Hash>(&self, key: &K) -> usize {
         let mut hasher = rustc_hash::FxHasher::default();
         key.hash(&mut hasher);
-        hasher.finish() as usize % IN_MEMORY_SHARDS
+        // Use fast bitwise AND instead of slow modulo
+        hasher.finish() as usize & (IN_MEMORY_SHARDS - 1)
     }
 }
 
@@ -69,7 +75,8 @@ impl KvStore for InMemoryStore {
         let mut list = SmallVec::new();
         list.push(value);
         let index = self.get_shard_index(&key);
-        let mut shard = self.shards[index].lock().unwrap();
+        // A `set` is a write operation, so we take a write lock
+        let mut shard = self.shards[index].write();
         shard.insert(key, list);
         Ok(())
     }
@@ -77,14 +84,15 @@ impl KvStore for InMemoryStore {
     #[inline]
     fn get(&self, key: &Bytes) -> Result<Option<Bytes>> {
         let index = self.get_shard_index(key);
-        let shard = self.shards[index].lock().unwrap();
+        // A `get` is a read operation, allowing concurrent reads
+        let shard = self.shards[index].read();
         Ok(shard.get(key).and_then(|entry| entry.first().cloned()))
     }
 
     #[inline]
     fn lpush(&self, key: &Bytes, value: Bytes) -> Result<()> {
         let index = self.get_shard_index(key);
-        let mut shard = self.shards[index].lock().unwrap();
+        let mut shard = self.shards[index].write();
         let list = shard.entry(key.clone()).or_default();
         list.insert(0, value);
         Ok(())
@@ -93,7 +101,7 @@ impl KvStore for InMemoryStore {
     #[inline]
     fn ltrim(&self, key: &Bytes, start: isize, stop: isize) -> Result<()> {
         let index = self.get_shard_index(key);
-        let mut shard = self.shards[index].lock().unwrap();
+        let mut shard = self.shards[index].write();
         if let Some(list) = shard.get_mut(key) {
             if start == 0 && stop >= 0 {
                 let end = (stop + 1) as usize;
@@ -108,7 +116,7 @@ impl KvStore for InMemoryStore {
     #[inline]
     fn lrange(&self, key: &Bytes, start: isize, stop: isize) -> Result<SmallVec<[Bytes; 8]>> {
         let index = self.get_shard_index(key);
-        let shard = self.shards[index].lock().unwrap();
+        let shard = self.shards[index].read();
         if let Some(list) = shard.get(key) {
             if start == 0 && stop >= 0 {
                 let end = (stop + 1).min(list.len() as isize) as usize;
@@ -149,6 +157,43 @@ impl Decoder for RespCodec {
     }
 }
 
+// --- Custom fast integer parser ---
+#[inline]
+fn parse_integer(buf: &[u8]) -> Result<Option<(i64, usize)>> {
+    if buf.is_empty() { return Ok(None); }
+
+    let mut i = 0;
+    let mut sign = 1i64;
+    let mut num = 0i64;
+
+    if buf[0] == b'-' {
+        sign = -1;
+        i += 1;
+    }
+
+    if i >= buf.len() || !buf[i].is_ascii_digit() {
+        if i > 0 { return Err(anyhow::anyhow!("invalid integer format")); }
+    }
+
+    while i < buf.len() {
+        let b = buf[i];
+        if b.is_ascii_digit() {
+            num = num * 10 + (b - b'0') as i64;
+            i += 1;
+        } else if b == b'\r' {
+            if i + 1 < buf.len() && buf[i + 1] == b'\n' {
+                return Ok(Some((sign * num, i + 2)));
+            } else {
+                return Ok(None); // Incomplete line
+            }
+        } else {
+            return Err(anyhow::anyhow!("invalid character in integer"));
+        }
+    }
+    Ok(None)
+}
+
+
 impl RespCodec {
     fn parse_frame(src: &[u8]) -> Result<Option<(RespFrame, usize)>> {
         if src.is_empty() { return Ok(None); }
@@ -162,7 +207,7 @@ impl RespCodec {
     }
 
     fn parse_array(src: &[u8]) -> Result<Option<(RespFrame, usize)>> {
-        let (len, mut consumed) = match Self::parse_integer(&src[1..])? {
+        let (len, mut consumed) = match parse_integer(&src[1..])? {
             Some((len, consumed)) => (len, consumed + 1),
             None => return Ok(None),
         };
@@ -182,7 +227,7 @@ impl RespCodec {
     }
 
     fn parse_bulk_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>> {
-        let (len, consumed) = match Self::parse_integer(&src[1..])? {
+        let (len, consumed) = match parse_integer(&src[1..])? {
             Some((len, consumed)) => (len, consumed + 1),
             None => return Ok(None),
         };
@@ -209,19 +254,12 @@ impl RespCodec {
             Ok(Some((RespFrame::Error(data), total_len)))
         } else { Ok(None) }
     }
-
-    fn parse_integer(buf: &[u8]) -> Result<Option<(i64, usize)>> {
-        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-            let num_str = std::str::from_utf8(&buf[..pos])?;
-            let num = num_str.parse::<i64>()?;
-            Ok(Some((num, pos + 2)))
-        } else { Ok(None) }
-    }
 }
 
 
 impl Encoder<RespFrame> for RespCodec {
     type Error = anyhow::Error;
+
     fn encode(&mut self, item: RespFrame, dst: &mut BytesMut) -> Result<()> {
         match item {
             RespFrame::SimpleString(data) => {
@@ -235,12 +273,16 @@ impl Encoder<RespFrame> for RespCodec {
                 dst.extend_from_slice(b"\r\n");
             }
             RespFrame::Bulk(data) => {
-                dst.extend_from_slice(format!("${}\r\n", data.len()).as_bytes());
+                dst.extend_from_slice(b"$");
+                dst.extend_from_slice(itoa::Buffer::new().format(data.len()).as_bytes());
+                dst.extend_from_slice(b"\r\n");
                 dst.extend_from_slice(&data);
                 dst.extend_from_slice(b"\r\n");
             }
             RespFrame::Array(elements) => {
-                dst.extend_from_slice(format!("*{}\r\n", elements.len()).as_bytes());
+                dst.extend_from_slice(b"*");
+                dst.extend_from_slice(itoa::Buffer::new().format(elements.len()).as_bytes());
+                dst.extend_from_slice(b"\r\n");
                 for element in elements {
                     self.encode(*element, dst)?;
                 }
@@ -343,7 +385,7 @@ fn main() -> Result<()> {
     })
 }
 
-#[instrument(skip(stream, db), fields(client_addr = %stream.peer_addr().unwrap()))]
+#[instrument(skip_all, fields(client_addr = %stream.peer_addr().unwrap()))]
 async fn handle_connection(stream: TcpStream, db: Arc<InMemoryStore>) -> Result<()> {
     stream.set_nodelay(true)?;
     
@@ -365,8 +407,6 @@ async fn handle_connection(stream: TcpStream, db: Arc<InMemoryStore>) -> Result<
     Ok(())
 }
 
-// This function is synchronous and executes directly on the async worker's thread.
-// This is fast because the work is trivial (nanoseconds) and avoids scheduling overhead.
 #[inline]
 fn execute_command(cmd: Command, db: &InMemoryStore) -> RespFrame {
     match cmd {

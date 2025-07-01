@@ -18,6 +18,8 @@ futures = "0.3"
 num_cpus = "1.17"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+parking_lot = "0.12.3"
+itoa = "1.0.11"
 
 [profile.maxperf]
 inherits = "release"

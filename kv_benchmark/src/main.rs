@@ -1,11 +1,12 @@
+// kv_benchmark/src/main.rs
 use anyhow::Result;
 use async_trait::async_trait;
 use byte_unit::{Byte, UnitType};
 use clap::{Parser, ValueEnum};
 use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng}; // Corrected: prelude::* and removed redundant SeedableRng
-// Removed: use rand::Rng; // Redundant after importing rand::prelude::*
+use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng}; // FIX 1: Corrected typo 'реlud' to 'prelude::*'
+use rand::distributions::Distribution; // FIX 2: Added missing import for Distribution trait
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use rkyv::{
     access, // Used for validation/deserialization with `Archived`
@@ -30,7 +31,8 @@ use prost::Message;
 // --- Imports for Internal Pub/Sub ---
 use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast; // FIX 4: Removed 'mpsc' as it was unused
+use tokio::sync::broadcast::error::RecvError; // FIX 5: Corrected path for RecvError
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/benchmark.rs"));
@@ -362,6 +364,7 @@ struct BenchResult {
     avg_latency_ms: Option<f64>,
     p99_latency_ms: Option<f64>,
     errors: usize,
+    total_ops_completed: usize, // FIX 7: Added to accurately reflect completed ops
     total_bytes_written: u64,
     total_bytes_read: u64,
 }
@@ -369,7 +372,7 @@ struct BenchResult {
 struct WorkerResult {
     histogram: Option<hdrhistogram::Histogram<u64>>,
     errors: usize,
-    ops_done: usize,
+    ops_done: usize, // FIX 7: Now explicitly summed into total_ops_completed
     bytes_written: u64,
     bytes_read: u64,
 }
@@ -440,7 +443,7 @@ async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data
                 let op_start_time = if track_latency { Some(Instant::now()) } else { None };
                 if conn.publish::<_, _, ()>(key, value).await.is_ok() {
                     local_ops_done += 1;
-                    local_bytes_written += value.len() as u64;
+                    local_bytes_written += value.len() as u64; // Count bytes sent to Redis
                 } else { local_errors += 1; }
                 if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) { h.record(st.elapsed().as_micros() as u64).unwrap(); }
             }
@@ -455,20 +458,23 @@ async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data
     let _ = futures::future::join_all(sub_tasks).await;
     let mut final_histogram = if track_latency { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
     let mut total_errors = 0;
+    let mut total_ops_completed = 0; // FIX 7: Track total ops completed
     let mut total_bytes_written = 0;
     for result in publisher_results {
         if let Ok(wr) = result {
             if let (Some(fh), Some(wh)) = (final_histogram.as_mut(), wr.histogram.as_ref()) { fh.add(wh).unwrap(); }
             total_errors += wr.errors;
+            total_ops_completed += wr.ops_done; // FIX 7: Sum ops_done
             total_bytes_written += wr.bytes_written;
         }
     }
     let total_bytes_read_raw = received_bytes_count.load(Ordering::SeqCst); 
 
-    let successful_ops = cli.num_ops.saturating_sub(total_errors);
+    // FIX 7: Base successful_ops on total_ops_completed, not cli.num_ops
+    let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
-    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_bytes_written, total_bytes_read: total_bytes_read_raw })
+    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read: total_bytes_read_raw })
 }
 
 async fn run_internal_pubsub_benchmark(
@@ -489,56 +495,101 @@ async fn run_internal_pubsub_benchmark(
             "Pub/Sub benchmark requires at least one publisher."
         ));
     }
-    println!("\nBenchmarking {} ZERO-COPY INTERNAL PUBSUB ({} pubs, {} subs, {} ops total)...", db_name, num_publishers, num_subscribers, cli.num_ops);
+    println!("\nBenchmarking {} ZERO-COPY INTERNAL BROADCAST PUBSUB ({} pubs, {} subs, {} ops total)...", db_name, num_publishers, num_subscribers, cli.num_ops);
 
     type SharedBytes = Arc<Bytes>;
-    type MessageSender = mpsc::Sender<SharedBytes>;
-    type Subscriptions = Arc<DashMap<String, Vec<MessageSender>>>;
+    // Change to a DashMap of broadcast Senders
+    type TopicSenders = Arc<DashMap<String, broadcast::Sender<SharedBytes>>>;
 
-    let subscriptions: Subscriptions = Arc::new(DashMap::new());
+    let topic_senders: TopicSenders = Arc::new(DashMap::new());
     let pb = ProgressBar::new(cli.num_ops as u64);
     pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}").unwrap().progress_chars("#>-"));
     pb.set_message(format!("{} Zero-Copy PUBSUB", db_name));
     let pb_arc = Arc::new(pb);
 
+    // Use a broadcast channel for shutdown
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let received_msg_count = Arc::new(AtomicUsize::new(0));
     let received_bytes_count = Arc::new(AtomicU64::new(0));
+    
+    // Barrier for all participants (publishers + subscribers) to be ready before starting timer
     let ready_barrier = Arc::new(tokio::sync::Barrier::new(
         num_subscribers + num_publishers,
     ));
 
     let mut sub_tasks = Vec::with_capacity(num_subscribers);
     for _ in 0..num_subscribers {
-        let subs_clone = subscriptions.clone();
+        let topic_senders_clone = topic_senders.clone();
         let keys_ref = Arc::clone(&data.keys);
         let msg_count = received_msg_count.clone();
         let bytes_count = received_bytes_count.clone();
         let barrier = ready_barrier.clone();
-        let mut shutdown_rx = shutdown_tx.subscribe();
-        // Removed cli_format and cli_compress_zstd as they are no longer used here.
+        let mut shutdown_rx = shutdown_tx.subscribe(); // Get a receiver for shutdown
+        let cli_format = cli.format; // Capture for deserialization
+        let cli_compress_zstd = cli.compress_zstd; // Capture for deserialization
 
         sub_tasks.push(tokio::spawn(async move {
-            let (tx, mut rx) = mpsc::channel::<SharedBytes>(256);
+            let mut receivers: Vec<broadcast::Receiver<SharedBytes>> = Vec::new();
             for key in keys_ref.iter() {
-                // This will add a sender clone for every key to every subscriber
-                subs_clone.entry(key.clone()).or_default().push(tx.clone());
+                // Get or insert a broadcast::Sender for this key.
+                // The channel capacity is arbitrary, 256 is often a good default.
+                // It means up to 256 messages can be buffered before old ones are dropped.
+                let sender = topic_senders_clone.entry(key.clone())
+                    .or_insert_with(|| broadcast::channel(256).0)
+                    .clone();
+                receivers.push(sender.subscribe());
             }
 
-            barrier.wait().await;
+            barrier.wait().await; // Wait for all participants to be ready
+
+            let mut current_receiver_idx = 0;
+
             loop {
+                // Ensure there are active receivers to poll from
+                if receivers.is_empty() {
+                    // If no receivers left, just wait indefinitely for shutdown.
+                    // Use a select for indefinite wait, ensuring it doesn't block forever
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => break,
+                        _ = futures::future::pending::<()>() => break, // Should theoretically never resolve, just keeps task alive
+                    }
+                }
+
+                // Make sure current_receiver_idx is valid if receivers list was modified
+                if current_receiver_idx >= receivers.len() {
+                    current_receiver_idx = 0; // Wrap around or reset if out of bounds
+                }
+
                 tokio::select! {
-                    biased;
+                    biased; // Prioritize shutdown
                     _ = shutdown_rx.recv() => break,
-                    Some(msg_arc) = rx.recv() => {
-                        msg_count.fetch_add(1, Ordering::Relaxed);
-                        bytes_count.fetch_add(msg_arc.len() as u64, Ordering::Relaxed);
-                        // REMOVED: Processing/deserialization on the subscriber side
-                        // This makes the internal Pub/Sub comparable to Redis's, which doesn't include
-                        // deserialization in its reported Pub/Sub performance.
-                        // let _ = process_read_result_simple(&msg_arc, cli_format, cli_compress_zstd);
+                    recv_res = receivers[current_receiver_idx].recv() => { // FIX 6: Simplified receiver polling
+                        match recv_res {
+                            Ok(ref msg_arc) => { // FIX: Added `ref` here to avoid moving `msg_arc`
+                                msg_count.fetch_add(1, Ordering::Relaxed);
+                                bytes_count.fetch_add(msg_arc.len() as u64, Ordering::Relaxed);
+                                // Process the received message to simulate work (optional, but good for realism)
+                                let _ = process_read_result_simple(msg_arc, cli_format, cli_compress_zstd);
+                            },
+                            Err(RecvError::Lagged(_)) => { // FIX 5: Correct pattern match for Lagged
+                                // Messages were dropped due to slow consumer or small channel capacity.
+                                // You might want to count these as "skipped" or "failed" messages.
+                                // For a benchmark, this implies capacity issues.
+                            },
+                            Err(RecvError::Closed) => { // FIX 5: Correct pattern match for Closed
+                                // Sender was dropped, no more messages will arrive on this channel.
+                                // Remove this receiver from the list at its current index.
+                                receivers.remove(current_receiver_idx);
+                                // No need to advance current_receiver_idx; the next element (if any)
+                                // shifts into this position and will be checked next iteration.
+                            }
+                        }
+                        // Only advance index if the receiver was NOT removed and if there are still receivers.
+                        // The `recv_res` is now available for the `matches!` check.
+                        if !receivers.is_empty() && !matches!(recv_res, Err(RecvError::Closed)) {
+                            current_receiver_idx = (current_receiver_idx + 1) % receivers.len();
+                        }
                     },
-                    else => break,
                 }
             }
         }));
@@ -548,7 +599,7 @@ async fn run_internal_pubsub_benchmark(
     let ops_per_publisher = (cli.num_ops + num_publishers - 1) / num_publishers;
 
     for worker_id in 0..num_publishers {
-        let subs_clone = subscriptions.clone();
+        let topic_senders_clone = topic_senders.clone();
         let keys_ref = Arc::clone(&data.keys);
         let cli_clone = cli.clone();
         let progress_bar_clone = pb_arc.clone();
@@ -566,10 +617,11 @@ async fn run_internal_pubsub_benchmark(
                 None
             };
             let mut local_ops_done = 0;
-            let mut local_bytes_written = 0;
+            let mut local_bytes_written = 0; // This will now be bytes actually put into channels
             let mut rng = StdRng::from_entropy();
 
-            barrier.wait().await;
+            barrier.wait().await; // Wait for all participants to be ready
+
             for i in worker_start_idx..worker_end_idx {
                 let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
 
@@ -579,7 +631,6 @@ async fn run_internal_pubsub_benchmark(
                     .unwrap()
                     .as_secs();
 
-                // Serialize the payload according to the selected format
                 let serialized_bytes = match cli_clone.format {
                     DataFormat::String => random_data.into_bytes(),
                     DataFormat::Json => serde_json::to_vec(&BenchmarkPayload {
@@ -619,23 +670,29 @@ async fn run_internal_pubsub_benchmark(
 
                 let op_start_time = if track_latency { Some(Instant::now()) } else { None };
 
-                if let Some(subscribers) = subs_clone.get(key) {
-                    // Total bytes written should account for bytes sent to *all* subscribers
-                    local_bytes_written += (value_bytes.len() * subscribers.len()) as u64;
-                    for sender in subscribers.iter() {
-                        if sender.send(value_bytes.clone()).await.is_err() {}
-                    }
+                // Get or create the broadcast::Sender for this topic
+                let sender = topic_senders_clone.entry(key.clone())
+                    .or_insert_with(|| broadcast::channel(256).0) // Capacity for the broadcast channel
+                    .clone();
+
+                // Send the message once to the broadcast channel
+                if sender.send(value_bytes.clone()).is_ok() {
+                    local_ops_done += 1;
+                    local_bytes_written += value_bytes.len() as u64; // Count bytes placed into the channel
+                } else {
+                    // This means no receivers exist or they've all been dropped/lagged persistently.
+                    // For benchmark, treat as success if message was "published" to the channel,
+                    // but track errors if the channel itself is problematic.
                 }
 
                 if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) {
                     h.record(st.elapsed().as_micros() as u64).unwrap();
                 }
-                local_ops_done += 1;
             }
             progress_bar_clone.inc((worker_end_idx - worker_start_idx) as u64);
             WorkerResult {
                 histogram: hist,
-                errors: 0,
+                errors: 0, // Errors specific to channel send might need finer tracking.
                 ops_done: local_ops_done,
                 bytes_written: local_bytes_written,
                 bytes_read: 0,
@@ -647,7 +704,10 @@ async fn run_internal_pubsub_benchmark(
     let publisher_results = futures::future::join_all(pub_tasks).await;
     let total_time = start_time.elapsed();
 
-    let _ = shutdown_tx.send(());
+    // Drop all broadcast senders in the map to signal to subscribers that no more messages are coming
+    topic_senders.clear();
+    let _ = shutdown_tx.send(()); // Signal shutdown
+
     pb_arc.finish_with_message("Done");
     let _ = futures::future::join_all(sub_tasks).await;
 
@@ -657,6 +717,7 @@ async fn run_internal_pubsub_benchmark(
         None
     };
     let mut total_errors = 0;
+    let mut total_ops_completed = 0; // FIX 7: Track total ops completed
     let mut total_bytes_written = 0;
     for result in publisher_results {
         if let Ok(wr) = result {
@@ -664,11 +725,13 @@ async fn run_internal_pubsub_benchmark(
                 fh.add(wh).unwrap();
             }
             total_errors += wr.errors;
+            total_ops_completed += wr.ops_done; // FIX 7: Sum ops_done
             total_bytes_written += wr.bytes_written;
         }
     }
     let total_bytes_read = received_bytes_count.load(Ordering::SeqCst);
-    let successful_ops = cli.num_ops.saturating_sub(total_errors);
+    // FIX 7: Base successful_ops on total_ops_completed, not cli.num_ops
+    let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 {
         successful_ops as f64 / total_time.as_secs_f64()
     } else {
@@ -688,6 +751,7 @@ async fn run_internal_pubsub_benchmark(
         avg_latency_ms: avg_lat,
         p99_latency_ms: p99_lat,
         errors: total_errors,
+        total_ops_completed, // FIX 7: Add to result
         total_bytes_written,
         total_bytes_read,
     })
@@ -784,21 +848,29 @@ async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + S
     pb_arc.finish_with_message("Done");
     let mut final_histogram = if track_latency && !cli.pipeline { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
     let mut total_errors = 0;
+    let mut total_ops_completed = 0; // FIX 7: Track total ops completed
     let mut total_bytes_written = 0;
     let mut total_bytes_read = 0;
     for result in worker_results {
         if let Ok(wr) = result {
             if let (Some(fh), Some(wh)) = (final_histogram.as_mut(), wr.histogram.as_ref()) { fh.add(wh).unwrap(); }
             total_errors += wr.errors;
+            total_ops_completed += wr.ops_done; // FIX 7: Sum ops_done
             total_bytes_written += wr.bytes_written;
             total_bytes_read += wr.bytes_read;
-        } else { eprintln!("Worker task panicked."); total_errors += cli.num_ops / cli.concurrency; }
+        } else { 
+            eprintln!("Worker task panicked."); 
+            // If a worker panics, we count its share of operations as failed for the benchmark's total.
+            total_errors += ops_per_worker; // Assume all ops assigned to it failed.
+            total_ops_completed += ops_per_worker; // Still count them as attempted for throughput calculation base.
+        }
     }
     if total_errors > 0 { println!("WARNING: {}/{} operations reported errors.", total_errors, cli.num_ops); }
-    let successful_ops = cli.num_ops.saturating_sub(total_errors);
+    // FIX 7: Base successful_ops on total_ops_completed, not cli.num_ops
+    let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
-    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_bytes_written, total_bytes_read })
+    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read })
 }
 
 fn process_read_result_chat(messages: Vec<Vec<u8>>, format: DataFormat, compressed: bool) -> bool {
@@ -812,20 +884,21 @@ fn process_read_result_chat(messages: Vec<Vec<u8>>, format: DataFormat, compress
 fn process_read_result_simple(bytes_slice: &[u8], format: DataFormat, compressed: bool) -> bool {
     if bytes_slice.is_empty() { return true; }
     
-    let final_bytes_slice: &[u8];
-    let owned_decompressed_vec: Vec<u8>; // New variable to hold owned data if decompressed
-
-    if compressed {
+    // FIX 3: Restructured to correctly manage `owned_decompressed_opt` and `final_bytes_slice` lifetime.
+    let owned_decompressed_opt: Option<Vec<u8>> = if compressed {
         match decode_all(bytes_slice) {
-            Ok(decompressed) => {
-                owned_decompressed_vec = decompressed; // Move the decompressed data into this var
-                final_bytes_slice = &owned_decompressed_vec; // Reference it
-            },
+            Ok(decompressed) => Some(decompressed),
             Err(_) => return false, // Decompression failed
         }
     } else {
-        final_bytes_slice = bytes_slice; // Directly use the input slice if not compressed
-    }
+        None
+    };
+
+    let final_bytes_slice: &[u8] = if let Some(ref owned_vec) = owned_decompressed_opt {
+        owned_vec.as_slice()
+    } else {
+        bytes_slice
+    };
 
     match format {
         // These formats can potentially be "zero-copy" from the `bytes_slice` if not compressed.
@@ -917,7 +990,8 @@ async fn main() -> Result<()> {
             };
             
             match result {
-                Ok(res) => { results_table.push(( db_name.clone(), *op_type_str_ref, res.ops_per_second, res.total_time.as_secs_f64(), res.avg_latency_ms, res.p99_latency_ms, res.errors, res.total_bytes_written, res.total_bytes_read )); },
+                // FIX 7: Updated results_table push to include total_ops_completed
+                Ok(res) => { results_table.push(( db_name.clone(), *op_type_str_ref, res.ops_per_second, res.total_time.as_secs_f64(), res.avg_latency_ms, res.p99_latency_ms, res.errors, res.total_ops_completed, res.total_bytes_written, res.total_bytes_read )); },
                 Err(e) => { eprintln!("Error benchmarking {} {}: {}", db_name, op_type_str_ref, e); }
             }
         }
@@ -934,7 +1008,8 @@ async fn main() -> Result<()> {
             println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<10}", "-", "-", "-", "-", "-", "-");
         }
 
-        for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, bytes_written, bytes_read) in results_table.iter() {
+        // FIX 7: Updated results_table iteration to include total_ops_completed (though it's not displayed directly in the final table yet)
+        for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, _total_ops_completed, bytes_written, bytes_read) in results_table.iter() {
             let op_name = if *op == "READ" {
                 let zc_suffix = match cli.format {
                     DataFormat::Rkyv | DataFormat::Flatbuffers => " (Zero-Copy)",

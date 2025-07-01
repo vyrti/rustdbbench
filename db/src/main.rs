@@ -31,7 +31,7 @@ struct Cli {
 }
 
 //================================================================
-// In-Memory Key-Value Store (The "Engine") - SYNCHRONOUS
+// In-Memory Key-Value Store (The "Engine") - NOW WITH RwLock
 //================================================================
 
 pub trait KvStore: Send + Sync {
@@ -43,10 +43,11 @@ pub trait KvStore: Send + Sync {
 }
 
 type ListValue = SmallVec<[Bytes; 8]>;
-const IN_MEMORY_SHARDS: usize = 256; // Must be a power of two
+const IN_MEMORY_SHARDS: usize = 256;
 
 #[derive(Clone)]
 pub struct InMemoryStore {
+    // Replaced Mutex with RwLock
     shards: Arc<Vec<RwLock<FxHashMap<Bytes, ListValue>>>>,
 }
 
@@ -64,7 +65,6 @@ impl InMemoryStore {
     fn get_shard_index<K: Hash>(&self, key: &K) -> usize {
         let mut hasher = rustc_hash::FxHasher::default();
         key.hash(&mut hasher);
-        // Use fast bitwise AND instead of slow modulo
         hasher.finish() as usize & (IN_MEMORY_SHARDS - 1)
     }
 }
@@ -75,7 +75,7 @@ impl KvStore for InMemoryStore {
         let mut list = SmallVec::new();
         list.push(value);
         let index = self.get_shard_index(&key);
-        // A `set` is a write operation, so we take a write lock
+        // Use a write lock for mutation
         let mut shard = self.shards[index].write();
         shard.insert(key, list);
         Ok(())
@@ -84,7 +84,7 @@ impl KvStore for InMemoryStore {
     #[inline]
     fn get(&self, key: &Bytes) -> Result<Option<Bytes>> {
         let index = self.get_shard_index(key);
-        // A `get` is a read operation, allowing concurrent reads
+        // Use a read lock for non-mutating access, allowing concurrent reads
         let shard = self.shards[index].read();
         Ok(shard.get(key).and_then(|entry| entry.first().cloned()))
     }
@@ -157,7 +157,6 @@ impl Decoder for RespCodec {
     }
 }
 
-// --- Custom fast integer parser ---
 #[inline]
 fn parse_integer(buf: &[u8]) -> Result<Option<(i64, usize)>> {
     if buf.is_empty() { return Ok(None); }
@@ -184,7 +183,7 @@ fn parse_integer(buf: &[u8]) -> Result<Option<(i64, usize)>> {
             if i + 1 < buf.len() && buf[i + 1] == b'\n' {
                 return Ok(Some((sign * num, i + 2)));
             } else {
-                return Ok(None); // Incomplete line
+                return Ok(None);
             }
         } else {
             return Err(anyhow::anyhow!("invalid character in integer"));

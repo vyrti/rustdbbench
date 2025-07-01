@@ -5,11 +5,19 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.45.1", features = ["full"] }
-anyhow = "1.0.86"
+anyhow = "1.0"
 rustc-hash = "1.1.0"
-async-trait = "0.1.80"
+async-trait = "0.1"
 clap = { version = "4.5.40", features = ["derive"] }
 bytes = "1.6.0"
+dashmap = "5.5"
+ahash = "0.8"
+smallvec = { version = "1.11", features = ["union"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+num_cpus = "1.17"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [profile.maxperf]
 inherits = "release"

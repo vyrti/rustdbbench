@@ -1,15 +1,17 @@
 // rust_redis_server/src/main.rs
 use anyhow::Result;
-use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
 use clap::Parser;
-use rustc_hash::{FxHashMap, FxHasher};
+use futures::stream::{StreamExt};
+use futures::SinkExt;
+use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-
-const IN_MEMORY_SHARDS: usize = 128;
+use tokio_util::codec::{Decoder, Encoder, Framed};
+use tracing::{debug, error, info, instrument};
+use rustc_hash::FxHashMap;
 
 //================================================================
 // Command Line Interface
@@ -20,26 +22,29 @@ const IN_MEMORY_SHARDS: usize = 128;
 struct Cli {
     #[clap(short, long, default_value = "127.0.0.1:7878")]
     addr: String,
+    
+    #[clap(short = 't', long, default_value_t = num_cpus::get())]
+    threads: usize,
 }
 
 //================================================================
-// In-Memory Key-Value Store (The "Engine")
+// In-Memory Key-Value Store (The "Engine") - SYNCHRONOUS
 //================================================================
 
-#[async_trait]
 pub trait KvStore: Send + Sync {
-    async fn set(&self, key: Bytes, value: Bytes) -> Result<()>;
-    async fn get(&self, key: &Bytes) -> Result<Option<Bytes>>;
-    async fn lpush(&self, key: &Bytes, value: Bytes) -> Result<()>;
-    async fn ltrim(&self, key: &Bytes, start: isize, stop: isize) -> Result<()>;
-    async fn lrange(&self, key: &Bytes, start: isize, stop: isize) -> Result<Vec<Bytes>>;
+    fn set(&self, key: Bytes, value: Bytes) -> Result<()>;
+    fn get(&self, key: &Bytes) -> Result<Option<Bytes>>;
+    fn lpush(&self, key: &Bytes, value: Bytes) -> Result<()>;
+    fn ltrim(&self, key: &Bytes, start: isize, stop: isize) -> Result<()>;
+    fn lrange(&self, key: &Bytes, start: isize, stop: isize) -> Result<SmallVec<[Bytes; 8]>>;
 }
 
-type Shard = FxHashMap<Bytes, Vec<Bytes>>;
+type ListValue = SmallVec<[Bytes; 8]>;
+const IN_MEMORY_SHARDS: usize = 256; // Increased shards slightly
 
 #[derive(Clone)]
 pub struct InMemoryStore {
-    shards: Arc<Vec<StdMutex<Shard>>>,
+    shards: Arc<Vec<StdMutex<FxHashMap<Bytes, ListValue>>>>,
 }
 
 impl InMemoryStore {
@@ -52,28 +57,32 @@ impl InMemoryStore {
     }
 
     fn get_shard_index<K: Hash>(&self, key: &K) -> usize {
-        let mut hasher = FxHasher::default();
+        let mut hasher = rustc_hash::FxHasher::default();
         key.hash(&mut hasher);
         hasher.finish() as usize % IN_MEMORY_SHARDS
     }
 }
 
-#[async_trait]
 impl KvStore for InMemoryStore {
-    async fn set(&self, key: Bytes, value: Bytes) -> Result<()> {
+    #[inline]
+    fn set(&self, key: Bytes, value: Bytes) -> Result<()> {
+        let mut list = SmallVec::new();
+        list.push(value);
         let index = self.get_shard_index(&key);
         let mut shard = self.shards[index].lock().unwrap();
-        shard.insert(key, vec![value]);
+        shard.insert(key, list);
         Ok(())
     }
 
-    async fn get(&self, key: &Bytes) -> Result<Option<Bytes>> {
+    #[inline]
+    fn get(&self, key: &Bytes) -> Result<Option<Bytes>> {
         let index = self.get_shard_index(key);
         let shard = self.shards[index].lock().unwrap();
-        Ok(shard.get(key).and_then(|v| v.first().cloned()))
+        Ok(shard.get(key).and_then(|entry| entry.first().cloned()))
     }
 
-    async fn lpush(&self, key: &Bytes, value: Bytes) -> Result<()> {
+    #[inline]
+    fn lpush(&self, key: &Bytes, value: Bytes) -> Result<()> {
         let index = self.get_shard_index(key);
         let mut shard = self.shards[index].lock().unwrap();
         let list = shard.entry(key.clone()).or_default();
@@ -81,235 +90,322 @@ impl KvStore for InMemoryStore {
         Ok(())
     }
 
-    async fn ltrim(&self, key: &Bytes, start: isize, stop: isize) -> Result<()> {
+    #[inline]
+    fn ltrim(&self, key: &Bytes, start: isize, stop: isize) -> Result<()> {
         let index = self.get_shard_index(key);
         let mut shard = self.shards[index].lock().unwrap();
         if let Some(list) = shard.get_mut(key) {
             if start == 0 && stop >= 0 {
-                list.truncate((stop + 1) as usize);
+                let end = (stop + 1) as usize;
+                if end < list.len() {
+                    list.truncate(end);
+                }
             }
         }
         Ok(())
     }
 
-    async fn lrange(&self, key: &Bytes, start: isize, stop: isize) -> Result<Vec<Bytes>> {
+    #[inline]
+    fn lrange(&self, key: &Bytes, start: isize, stop: isize) -> Result<SmallVec<[Bytes; 8]>> {
         let index = self.get_shard_index(key);
         let shard = self.shards[index].lock().unwrap();
         if let Some(list) = shard.get(key) {
             if start == 0 && stop >= 0 {
                 let end = (stop + 1).min(list.len() as isize) as usize;
-                return Ok(list[..end].to_vec());
+                return Ok(list[..end].iter().cloned().collect());
             }
         }
-        Ok(vec![])
+        Ok(SmallVec::new())
     }
 }
 
 //================================================================
-// Server, Connection, and RESP Protocol Handling
+// RESP Protocol Codec
 //================================================================
 
-struct Connection {
-    stream: TcpStream,
-    buffer: BytesMut,
+pub struct RespCodec;
+
+#[derive(Debug, Clone)]
+pub enum RespFrame {
+    Array(SmallVec<[Box<RespFrame>; 8]>),
+    Bulk(Bytes),
+    SimpleString(Bytes),
+    Error(Bytes),
+    Null,
 }
 
-impl Connection {
-    pub fn new(stream: TcpStream) -> Self {
-        Connection {
-            stream,
-            buffer: BytesMut::with_capacity(4096),
+impl Decoder for RespCodec {
+    type Item = RespFrame;
+    type Error = anyhow::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let (frame, len) = match Self::parse_frame(src) {
+            Ok(Some((frame, len))) => (frame, len),
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        src.advance(len);
+        Ok(Some(frame))
+    }
+}
+
+impl RespCodec {
+    fn parse_frame(src: &[u8]) -> Result<Option<(RespFrame, usize)>> {
+        if src.is_empty() { return Ok(None); }
+        match src[0] {
+            b'*' => Self::parse_array(src),
+            b'$' => Self::parse_bulk_string(src),
+            b'+' => Self::parse_simple_string(src),
+            b'-' => Self::parse_error(src),
+            _ => Err(anyhow::anyhow!("Invalid RESP frame type")),
         }
     }
 
-    async fn read_frame(&mut self) -> Result<Option<RespFrame>> {
-        loop {
-            if let Some(frame) = self.parse_frame()? {
-                return Ok(Some(frame));
-            }
-            if self.stream.read_buf(&mut self.buffer).await? == 0 {
-                return if self.buffer.is_empty() { Ok(None) } else { Err(anyhow::anyhow!("connection reset by peer")) };
+    fn parse_array(src: &[u8]) -> Result<Option<(RespFrame, usize)>> {
+        let (len, mut consumed) = match Self::parse_integer(&src[1..])? {
+            Some((len, consumed)) => (len, consumed + 1),
+            None => return Ok(None),
+        };
+        if len == -1 { return Ok(Some((RespFrame::Null, consumed))); }
+        let len = len as usize;
+        let mut elements = SmallVec::with_capacity(len);
+        for _ in 0..len {
+            match Self::parse_frame(&src[consumed..])? {
+                Some((frame, frame_len)) => {
+                    elements.push(Box::new(frame));
+                    consumed += frame_len;
+                }
+                None => return Ok(None),
             }
         }
+        Ok(Some((RespFrame::Array(elements), consumed)))
     }
 
-    fn parse_frame(&mut self) -> Result<Option<RespFrame>> {
-        if self.buffer.is_empty() { return Ok(None); }
-        match self.buffer[0] {
-            b'*' => self.parse_array(),
-            _ => Err(anyhow::anyhow!("invalid frame; expected array")),
-        }
+    fn parse_bulk_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>> {
+        let (len, consumed) = match Self::parse_integer(&src[1..])? {
+            Some((len, consumed)) => (len, consumed + 1),
+            None => return Ok(None),
+        };
+        if len == -1 { return Ok(Some((RespFrame::Null, consumed))); }
+        let len = len as usize;
+        let total_len = consumed + len + 2;
+        if src.len() < total_len { return Ok(None); }
+        let data = Bytes::copy_from_slice(&src[consumed..consumed + len]);
+        Ok(Some((RespFrame::Bulk(data), total_len)))
+    }
+    
+    fn parse_simple_string(src: &[u8]) -> Result<Option<(RespFrame, usize)>> {
+        if let Some(pos) = src[1..].windows(2).position(|w| w == b"\r\n") {
+            let total_len = pos + 3;
+            let data = Bytes::copy_from_slice(&src[1..pos+1]);
+            Ok(Some((RespFrame::SimpleString(data), total_len)))
+        } else { Ok(None) }
     }
 
-    fn parse_array(&mut self) -> Result<Option<RespFrame>> {
-        let mut parsable_view = &self.buffer[1..];
-        
-        if let Some((len, _)) = parse_decimal(&mut parsable_view)? {
-            let mut elements = Vec::with_capacity(len as usize);
-            for _ in 0..len {
-                if parsable_view.is_empty() || parsable_view[0] != b'$' { return Ok(None); }
-                parsable_view = &parsable_view[1..];
-                
-                if let Some((bulk_len, _)) = parse_decimal(&mut parsable_view)? {
-                    let data_len = bulk_len as usize;
-                    if parsable_view.len() < data_len + 2 { return Ok(None); }
-                    let data = Bytes::copy_from_slice(&parsable_view[..data_len]);
-                    elements.push(RespFrame::Bulk(data));
-                    parsable_view = &parsable_view[data_len + 2..];
-                } else { return Ok(None); }
-            }
-            
-            let consumed = self.buffer.len() - parsable_view.len();
-            self.buffer.advance(consumed);
-            Ok(Some(RespFrame::Array(elements)))
+    fn parse_error(src: &[u8]) -> Result<Option<(RespFrame, usize)>> {
+        if let Some(pos) = src[1..].windows(2).position(|w| w == b"\r\n") {
+            let total_len = pos + 3;
+            let data = Bytes::copy_from_slice(&src[1..pos+1]);
+            Ok(Some((RespFrame::Error(data), total_len)))
+        } else { Ok(None) }
+    }
+
+    fn parse_integer(buf: &[u8]) -> Result<Option<(i64, usize)>> {
+        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+            let num_str = std::str::from_utf8(&buf[..pos])?;
+            let num = num_str.parse::<i64>()?;
+            Ok(Some((num, pos + 2)))
         } else { Ok(None) }
     }
 }
 
-fn parse_decimal(buf: &mut &[u8]) -> Result<Option<(i64, usize)>> {
-    if let Some(line_end) = buf.iter().position(|&b| b == b'\r') {
-        // If the \n isn't in the buffer yet, we can't parse the full line.
-        if line_end + 1 >= buf.len() {
-            return Ok(None);
-        }
-        // If the character after \r is not \n, it's a protocol error.
-        if buf[line_end + 1] != b'\n' {
-            return Err(anyhow::anyhow!("malformed line ending"));
-        }
 
-        let num_slice = &buf[..line_end];
-        let n = std::str::from_utf8(num_slice)?.parse::<i64>()?;
-        *buf = &buf[line_end + 2..];
-        Ok(Some((n, num_slice.len() + 2)))
-    } else {
-        Ok(None)
+impl Encoder<RespFrame> for RespCodec {
+    type Error = anyhow::Error;
+    fn encode(&mut self, item: RespFrame, dst: &mut BytesMut) -> Result<()> {
+        match item {
+            RespFrame::SimpleString(data) => {
+                dst.extend_from_slice(b"+");
+                dst.extend_from_slice(&data);
+                dst.extend_from_slice(b"\r\n");
+            }
+            RespFrame::Error(data) => {
+                dst.extend_from_slice(b"-");
+                dst.extend_from_slice(&data);
+                dst.extend_from_slice(b"\r\n");
+            }
+            RespFrame::Bulk(data) => {
+                dst.extend_from_slice(format!("${}\r\n", data.len()).as_bytes());
+                dst.extend_from_slice(&data);
+                dst.extend_from_slice(b"\r\n");
+            }
+            RespFrame::Array(elements) => {
+                dst.extend_from_slice(format!("*{}\r\n", elements.len()).as_bytes());
+                for element in elements {
+                    self.encode(*element, dst)?;
+                }
+            }
+            RespFrame::Null => {
+                dst.extend_from_slice(b"$-1\r\n");
+            }
+        }
+        Ok(())
     }
 }
 
-#[derive(Debug)]
-enum RespFrame {
-    Array(Vec<RespFrame>),
-    Bulk(Bytes),
-}
+//================================================================
+// Command Processing
+//================================================================
 
 #[derive(Debug)]
 enum Command {
-    Set(Bytes, Bytes),
-    Get(Bytes),
-    LPush(Bytes, Bytes),
-    LTrim(Bytes, isize, isize),
-    LRange(Bytes, isize, isize),
-    Ping,
-    Unknown(Bytes),
+    Set(Bytes, Bytes), Get(Bytes), LPush(Bytes, Bytes), LTrim(Bytes, isize, isize), LRange(Bytes, isize, isize), Ping, Unknown(Bytes),
+}
+
+fn next_bulk(args: &mut impl Iterator<Item = Box<RespFrame>>) -> Result<Bytes> {
+    match args.next() {
+        Some(fr) => match *fr {
+            RespFrame::Bulk(b) => Ok(b),
+            _ => Err(anyhow::anyhow!("argument must be a bulk string")),
+        },
+        None => Err(anyhow::anyhow!("not enough arguments")),
+    }
+}
+fn next_parsable<T>(args: &mut impl Iterator<Item = Box<RespFrame>>) -> Result<T>
+where T: FromStr, <T as FromStr>::Err: std::error::Error + Send + Sync + 'static {
+    let bytes = next_bulk(args)?;
+    Ok(std::str::from_utf8(&bytes)?.parse::<T>()?)
 }
 
 impl Command {
+    #[inline]
     fn from_frame(frame: RespFrame) -> Result<Command> {
-        let mut array = match frame {
+        let array = match frame {
             RespFrame::Array(array) => array,
             _ => return Err(anyhow::anyhow!("command must be an array")),
         };
-        let command_name = match array.remove(0) {
+        let mut args = array.into_iter();
+        let command_name_frame = args.next().ok_or_else(|| anyhow::anyhow!("empty command"))?;
+        let command_name = match *command_name_frame {
             RespFrame::Bulk(data) => data,
             _ => return Err(anyhow::anyhow!("command name must be a bulk string")),
         };
-
         let name = command_name.to_ascii_uppercase();
-        let mut args = array.into_iter().map(|f| match f {
-            RespFrame::Bulk(b) => b,
-            _ => Bytes::new(),
-        });
-
-        match &name[..] {
-            b"PING" => Ok(Command::Ping),
-            b"SET" => Ok(Command::Set(args.next().unwrap(), args.next().unwrap())),
-            b"GET" => Ok(Command::Get(args.next().unwrap())),
-            b"LPUSH" => Ok(Command::LPush(args.next().unwrap(), args.next().unwrap())),
-            b"LTRIM" => {
-                let key = args.next().unwrap();
-                let start = std::str::from_utf8(&args.next().unwrap())?.parse()?;
-                let stop = std::str::from_utf8(&args.next().unwrap())?.parse()?;
-                Ok(Command::LTrim(key, start, stop))
-            }
-            b"LRANGE" => {
-                let key = args.next().unwrap();
-                let start = std::str::from_utf8(&args.next().unwrap())?.parse()?;
-                let stop = std::str::from_utf8(&args.next().unwrap())?.parse()?;
-                Ok(Command::LRange(key, start, stop))
-            }
-            _ => Ok(Command::Unknown(command_name)),
-        }
+        let command = match &name[..] {
+            b"PING" => Command::Ping,
+            b"SET" => Command::Set(next_bulk(&mut args)?, next_bulk(&mut args)?),
+            b"GET" => Command::Get(next_bulk(&mut args)?),
+            b"LPUSH" => Command::LPush(next_bulk(&mut args)?, next_bulk(&mut args)?),
+            b"LTRIM" => Command::LTrim(next_bulk(&mut args)?, next_parsable(&mut args)?, next_parsable(&mut args)?),
+            b"LRANGE" => Command::LRange(next_bulk(&mut args)?, next_parsable(&mut args)?, next_parsable(&mut args)?),
+            _ => Command::Unknown(command_name),
+        };
+        if args.next().is_some() { return Err(anyhow::anyhow!("wrong number of arguments for command")); }
+        Ok(command)
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+//================================================================
+// Server and Connection Handling
+//================================================================
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_thread_ids(true)
+        .init();
+
     let cli = Cli::parse();
-    let listener = TcpListener::bind(&cli.addr).await?;
-    println!("RustRedisServer listening on {}", cli.addr);
-    let db = Arc::new(InMemoryStore::new());
+    
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cli.threads)
+        .enable_all()
+        .build()?;
 
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        let db_clone = db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, db_clone).await {
-                 eprintln!("[{}] Connection error: {}", addr, e);
-            }
-        });
-    }
+    rt.block_on(async {
+        let listener = TcpListener::bind(&cli.addr).await?;
+        info!("RustRedisServer listening on {} with {} threads", cli.addr, cli.threads);
+        
+        let db = Arc::new(InMemoryStore::new());
+
+        loop {
+            let (stream, addr) = listener.accept().await?;
+            let db_clone = db.clone();
+            
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(stream, db_clone).await {
+                    if !e.to_string().contains("Connection reset by peer") {
+                        error!(client_addr = %addr, error = %e, "Connection error");
+                    }
+                }
+            });
+        }
+    })
 }
 
+#[instrument(skip(stream, db), fields(client_addr = %stream.peer_addr().unwrap()))]
 async fn handle_connection(stream: TcpStream, db: Arc<InMemoryStore>) -> Result<()> {
-    let mut conn = Connection::new(stream);
-    loop {
-        match conn.read_frame().await? {
-            Some(frame) => {
-                let cmd = Command::from_frame(frame)?;
-                let response = match cmd {
-                    Command::Ping => Bytes::from_static(b"+PONG\r\n"),
-                    Command::Set(key, val) => {
-                        db.set(key, val).await?;
-                        Bytes::from_static(b"+OK\r\n")
-                    }
-                    Command::Get(key) => match db.get(&key).await? {
-                        Some(val) => {
-                            let mut resp = BytesMut::with_capacity(val.len() + 10);
-                            resp.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());
-                            resp.extend_from_slice(&val);
-                            resp.extend_from_slice(b"\r\n");
-                            resp.freeze()
-                        }
-                        None => Bytes::from_static(b"$-1\r\n"),
-                    },
-                    Command::LPush(key, val) => {
-                        db.lpush(&key, val).await?;
-                        Bytes::from_static(b"+OK\r\n")
-                    }
-                    Command::LTrim(key, start, stop) => {
-                        db.ltrim(&key, start, stop).await?;
-                        Bytes::from_static(b"+OK\r\n")
-                    }
-                    Command::LRange(key, start, stop) => {
-                        let items = db.lrange(&key, start, stop).await?;
-                        let mut resp = BytesMut::new();
-                        resp.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                        for item in items {
-                            resp.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
-                            resp.extend_from_slice(&item);
-                            resp.extend_from_slice(b"\r\n");
-                        }
-                        resp.freeze()
-                    }
-                    Command::Unknown(cmd) => {
-                        let err_msg = format!("-ERR unknown command `{:?}`\r\n", String::from_utf8_lossy(&cmd));
-                        Bytes::from(err_msg)
-                    }
-                };
-                conn.stream.write_all(&response).await?;
+    stream.set_nodelay(true)?;
+    
+    let mut framed = Framed::new(stream, RespCodec);
+    
+    while let Some(frame_result) = framed.next().await {
+        let response = match frame_result {
+            Ok(frame) => {
+                match Command::from_frame(frame) {
+                    Ok(cmd) => execute_command(cmd, &db),
+                    Err(e) => RespFrame::Error(Bytes::from(format!("ERR {}", e.to_string()))),
+                }
             }
-            None => break,
+            Err(e) => return Err(e),
+        };
+        framed.send(response).await?;
+    }
+    
+    Ok(())
+}
+
+// This function is synchronous and executes directly on the async worker's thread.
+// This is fast because the work is trivial (nanoseconds) and avoids scheduling overhead.
+#[inline]
+fn execute_command(cmd: Command, db: &InMemoryStore) -> RespFrame {
+    match cmd {
+        Command::Ping => RespFrame::SimpleString(Bytes::from_static(b"PONG")),
+        Command::Set(key, val) => {
+            match db.set(key, val) {
+                Ok(_) => RespFrame::SimpleString(Bytes::from_static(b"OK")),
+                Err(e) => RespFrame::Error(Bytes::from(e.to_string())),
+            }
+        }
+        Command::Get(key) => match db.get(&key) {
+            Ok(Some(val)) => RespFrame::Bulk(val),
+            Ok(None) => RespFrame::Null,
+            Err(e) => RespFrame::Error(Bytes::from(e.to_string())),
+        },
+        Command::LPush(key, val) => {
+            match db.lpush(&key, val) {
+                Ok(_) => RespFrame::SimpleString(Bytes::from_static(b"OK")),
+                Err(e) => RespFrame::Error(Bytes::from(e.to_string())),
+            }
+        }
+        Command::LTrim(key, start, stop) => {
+            match db.ltrim(&key, start, stop) {
+                Ok(_) => RespFrame::SimpleString(Bytes::from_static(b"OK")),
+                Err(e) => RespFrame::Error(Bytes::from(e.to_string())),
+            }
+        }
+        Command::LRange(key, start, stop) => {
+            match db.lrange(&key, start, stop) {
+                Ok(items) => {
+                    let array = items.into_iter().map(|item| Box::new(RespFrame::Bulk(item))).collect();
+                    RespFrame::Array(array)
+                }
+                Err(e) => RespFrame::Error(Bytes::from(e.to_string())),
+            }
+        }
+        Command::Unknown(cmd) => {
+            let err_msg = format!("ERR unknown command `{}`", String::from_utf8_lossy(&cmd));
+            RespFrame::Error(Bytes::from(err_msg))
         }
     }
-    Ok(())
 }

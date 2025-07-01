@@ -21,7 +21,10 @@ rkyv = { version = "0.8.10", features = ["alloc"] }
 rkyv_derive = "0.8.10"
 skytable = "0.8"
 zstd = "0.13.1"
-flatbuffers = "24.3.25" # Add flatbuffers runtime
+flatbuffers = "24.3.25"
+anyhow = "1.0.86"
+async-trait = "0.1.80"
+rustc-hash = "1.1.0"
 
 [profile.maxperf]
 inherits = "release"

@@ -1,4 +1,3 @@
-// kv_benchmark/src/main.rs
 use anyhow::Result;
 use async_trait::async_trait;
 use byte_unit::{Byte, UnitType};
@@ -8,8 +7,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng, SeedableRng};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use rkyv::{
-    access, rancor::Error as RkyvError, to_bytes, Archive, Deserialize as RkyvDeserialize,
-    Serialize as RkyvSerialize,
+    access, // Used for validation/deserialization with `Archived`
+    rancor::Error as RkyvError, // Renamed to avoid conflict with anyhow::Error
+    to_bytes, // For serializing to bytes
+    Archive, // For deriving Archive trait
+    Deserialize as RkyvDeserialize, // For deserializing archived types
+    Serialize as RkyvSerialize, // For serializing to archived types
+    Archived, // Needed for `access::<Archived<T>, E>`
 };
 use rustc_hash::{FxHashMap, FxHasher};
 use serde::{Deserialize as SerdeDeserialize, Serialize};
@@ -21,10 +25,11 @@ use zstd::stream::{decode_all, encode_all};
 
 use bitcode;
 use prost::Message;
-// NOTE: Custom client dependencies are no longer needed
-// use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-// use tokio::net::TcpStream;
-// use tokio::sync::Mutex as TokioMutex;
+
+// --- Imports for Internal Pub/Sub ---
+use bytes::Bytes;
+use dashmap::DashMap;
+use tokio::sync::{broadcast, mpsc};
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/benchmark.rs"));
@@ -296,8 +301,6 @@ impl KvStore for RedisStore {
     }
 }
 
-// NOTE: RustDbStore has been removed entirely.
-
 // --- Data Generation & Other Structs ---
 fn generate_random_string(len: usize, rng: &mut impl Rng) -> String {
     let mut s = String::with_capacity(len);
@@ -371,7 +374,6 @@ struct WorkerResult {
 }
 
 async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
-    // ... (this function remains unchanged)
     let num_publishers = cli.num_publishers;
     let num_subscribers = cli.concurrency.saturating_sub(num_publishers);
     if num_subscribers == 0 { return Err(anyhow::anyhow!("Pub/Sub benchmark requires at least one subscriber.")); }
@@ -466,8 +468,227 @@ async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data
     Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_bytes_written, total_bytes_read })
 }
 
+async fn run_internal_pubsub_benchmark(
+    db_name: &str,
+    cli: &Cli,
+    data: &PreGeneratedData,
+    track_latency: bool,
+) -> Result<BenchResult> {
+    let num_publishers = cli.num_publishers;
+    let num_subscribers = cli.concurrency.saturating_sub(num_publishers);
+    if num_subscribers == 0 {
+        return Err(anyhow::anyhow!(
+            "Pub/Sub benchmark requires at least one subscriber."
+        ));
+    }
+    if num_publishers == 0 {
+        return Err(anyhow::anyhow!(
+            "Pub/Sub benchmark requires at least one publisher."
+        ));
+    }
+    println!("\nBenchmarking {} ZERO-COPY INTERNAL PUBSUB ({} pubs, {} subs, {} ops total)...", db_name, num_publishers, num_subscribers, cli.num_ops);
+
+    type SharedBytes = Arc<Bytes>;
+    type MessageSender = mpsc::Sender<SharedBytes>;
+    type Subscriptions = Arc<DashMap<String, Vec<MessageSender>>>;
+
+    let subscriptions: Subscriptions = Arc::new(DashMap::new());
+    let pb = ProgressBar::new(cli.num_ops as u64);
+    pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}").unwrap().progress_chars("#>-"));
+    pb.set_message(format!("{} Zero-Copy PUBSUB", db_name));
+    let pb_arc = Arc::new(pb);
+
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let received_msg_count = Arc::new(AtomicUsize::new(0));
+    let received_bytes_count = Arc::new(AtomicU64::new(0));
+    let ready_barrier = Arc::new(tokio::sync::Barrier::new(
+        num_subscribers + num_publishers,
+    ));
+
+    let mut sub_tasks = Vec::with_capacity(num_subscribers);
+    for _ in 0..num_subscribers {
+        let subs_clone = subscriptions.clone();
+        let keys_ref = Arc::clone(&data.keys);
+        let msg_count = received_msg_count.clone();
+        let bytes_count = received_bytes_count.clone();
+        let barrier = ready_barrier.clone();
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let cli_format = cli.format;
+
+        sub_tasks.push(tokio::spawn(async move {
+            let (tx, mut rx) = mpsc::channel::<SharedBytes>(256);
+            for key in keys_ref.iter() {
+                // This will add a sender clone for every key to every subscriber
+                subs_clone.entry(key.clone()).or_default().push(tx.clone());
+            }
+
+            barrier.wait().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => break,
+                    Some(msg_arc) = rx.recv() => {
+                        msg_count.fetch_add(1, Ordering::Relaxed);
+                        bytes_count.fetch_add(msg_arc.len() as u64, Ordering::Relaxed);
+                        // Process message based on format to simulate read/deserialization cost.
+                        let _ = process_read_result_simple((*msg_arc).to_vec(), cli_format, false);
+                    },
+                    else => break,
+                }
+            }
+        }));
+    }
+
+    let mut pub_tasks = Vec::with_capacity(num_publishers);
+    let ops_per_publisher = (cli.num_ops + num_publishers - 1) / num_publishers;
+
+    for worker_id in 0..num_publishers {
+        let subs_clone = subscriptions.clone();
+        let keys_ref = Arc::clone(&data.keys);
+        let cli_clone = cli.clone();
+        let progress_bar_clone = pb_arc.clone();
+        let barrier = ready_barrier.clone();
+        let worker_start_idx = worker_id * ops_per_publisher;
+        let worker_end_idx = ((worker_id + 1) * ops_per_publisher).min(cli.num_ops);
+        if worker_start_idx >= worker_end_idx {
+            continue;
+        }
+
+        pub_tasks.push(tokio::spawn(async move {
+            let mut hist = if track_latency {
+                Some(hdrhistogram::Histogram::<u64>::new(3).unwrap())
+            } else {
+                None
+            };
+            let mut local_ops_done = 0;
+            let mut local_bytes_written = 0;
+            let mut rng = StdRng::from_entropy();
+
+            barrier.wait().await;
+            for i in worker_start_idx..worker_end_idx {
+                let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
+
+                let random_data = generate_random_string(cli_clone.value_size, &mut rng);
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                // Serialize the payload according to the selected format
+                let serialized_bytes = match cli_clone.format {
+                    DataFormat::String => random_data.into_bytes(),
+                    DataFormat::Json => serde_json::to_vec(&BenchmarkPayload {
+                        data: random_data,
+                        timestamp,
+                        id: i,
+                    })
+                    .unwrap(),
+                    DataFormat::Bitcode => bitcode::serialize(&BenchmarkPayload {
+                        data: random_data,
+                        timestamp,
+                        id: i,
+                    })
+                    .unwrap(),
+                    DataFormat::Protobuf => pb::BenchmarkPayload {
+                        data: random_data,
+                        timestamp,
+                        id: i as u64,
+                    }
+                    .encode_to_vec(),
+                    DataFormat::Rkyv => to_bytes::<RkyvError>(&BenchmarkPayload { data: random_data, timestamp, id: i }).unwrap().into_vec(),
+                    DataFormat::Flatbuffers => {
+                        let mut builder = flatbuffers::FlatBufferBuilder::new();
+                        let data_offset = builder.create_string(&random_data);
+                        let mut payload_builder =
+                            fbs::benchmark_fbs::BenchmarkPayloadBuilder::new(&mut builder);
+                        payload_builder.add_data(data_offset);
+                        payload_builder.add_timestamp(timestamp);
+                        payload_builder.add_id(i as u64);
+                        let payload_offset = payload_builder.finish();
+                        builder.finish(payload_offset, None);
+                        builder.finished_data().to_vec()
+                    }
+                };
+
+                let value_bytes: SharedBytes = Arc::new(Bytes::from(serialized_bytes));
+
+                let op_start_time = if track_latency { Some(Instant::now()) } else { None };
+
+                if let Some(subscribers) = subs_clone.get(key) {
+                    local_bytes_written += (value_bytes.len() * subscribers.len()) as u64;
+                    for sender in subscribers.iter() {
+                        if sender.send(value_bytes.clone()).await.is_err() {}
+                    }
+                }
+
+                if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) {
+                    h.record(st.elapsed().as_micros() as u64).unwrap();
+                }
+                local_ops_done += 1;
+            }
+            progress_bar_clone.inc((worker_end_idx - worker_start_idx) as u64);
+            WorkerResult {
+                histogram: hist,
+                errors: 0,
+                ops_done: local_ops_done,
+                bytes_written: local_bytes_written,
+                bytes_read: 0,
+            }
+        }));
+    }
+
+    let start_time = Instant::now();
+    let publisher_results = futures::future::join_all(pub_tasks).await;
+    let total_time = start_time.elapsed();
+
+    let _ = shutdown_tx.send(());
+    pb_arc.finish_with_message("Done");
+    let _ = futures::future::join_all(sub_tasks).await;
+
+    let mut final_histogram = if track_latency {
+        Some(hdrhistogram::Histogram::<u64>::new(3).unwrap())
+    } else {
+        None
+    };
+    let mut total_errors = 0;
+    let mut total_bytes_written = 0;
+    for result in publisher_results {
+        if let Ok(wr) = result {
+            if let (Some(fh), Some(wh)) = (final_histogram.as_mut(), wr.histogram.as_ref()) {
+                fh.add(wh).unwrap();
+            }
+            total_errors += wr.errors;
+            total_bytes_written += wr.bytes_written;
+        }
+    }
+    let total_bytes_read = received_bytes_count.load(Ordering::SeqCst);
+    let successful_ops = cli.num_ops.saturating_sub(total_errors);
+    let ops_per_second = if total_time.as_secs_f64() > 0.0 {
+        successful_ops as f64 / total_time.as_secs_f64()
+    } else {
+        0.0
+    };
+    let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() {
+        (
+            Some(hist.mean() / 1000.0),
+            Some(hist.value_at_percentile(99.0) as f64 / 1000.0),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(BenchResult {
+        ops_per_second,
+        total_time,
+        avg_latency_ms: avg_lat,
+        p99_latency_ms: p99_lat,
+        errors: total_errors,
+        total_bytes_written,
+        total_bytes_read,
+    })
+}
+
+
 async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + Send + Sync>, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
-    // ... (this function remains unchanged)
     let op_type_owned = op_type_ref.to_string();
     let _mode_str = if cli.pipeline { "PIPELINED" } else { "INDIVIDUAL" };
     let zero_copy_description = if op_type_owned == "READ" && matches!(cli.format, DataFormat::Rkyv | DataFormat::Flatbuffers) { " (Zero-Copy)" } else { "" };
@@ -580,9 +801,15 @@ fn process_read_result_chat(messages: Vec<Vec<u8>>, format: DataFormat, compress
 
 fn process_read_result_simple(bytes: Vec<u8>, format: DataFormat, compressed: bool) -> bool {
     if bytes.is_empty() { return true; }
-    let owned_bytes = if compressed { decode_all(bytes.as_slice()).unwrap() } else { bytes };
+    let owned_bytes = if compressed {
+        // Handle decompression errors
+        match decode_all(bytes.as_slice()) {
+            Ok(decompressed) => decompressed,
+            Err(_) => return false, // Decompression failed
+        }
+    } else { bytes };
     match format {
-        DataFormat::Rkyv => access::<ArchivedBenchmarkPayload, RkyvError>(&owned_bytes).map(|_| true).unwrap_or(false),
+        DataFormat::Rkyv => access::<Archived<BenchmarkPayload>, RkyvError>(&owned_bytes).map(|_| true).unwrap_or(false), // Uses `access` for validation
         DataFormat::Flatbuffers => flatbuffers::root::<fbs::benchmark_fbs::BenchmarkPayload>(&owned_bytes).is_ok(),
         DataFormat::Json => serde_json::from_slice::<BenchmarkPayload>(&owned_bytes).is_ok(),
         DataFormat::Bitcode => bitcode::deserialize::<BenchmarkPayload>(&owned_bytes).is_ok(),
@@ -604,10 +831,6 @@ async fn main() -> Result<()> {
     if cli.db != DbChoice::InMemory {
         println!("Ensure Redis ({}), Valkey ({}), and RustDb ({}) are running", cli.redis_url, cli.valkey_url, cli.rustdb_url);
     }
-    if cli.pubsub_only && (cli.db == DbChoice::InMemory || cli.db == DbChoice::RustDb) {
-        println!("\nPub/Sub benchmark is not supported for {:?}. Please use Redis or Valkey.", cli.db);
-        return Ok(());
-    }
 
     if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
 
@@ -619,7 +842,12 @@ async fn main() -> Result<()> {
         _ => { eprintln!("Error: Please specify at most one of --write-only, --read-only, or --pubsub-only."); return Ok(()); }
     };
 
-    let op_for_data_gen = if benchmarks_to_run.contains(&"PUBSUB") { "PUBSUB" } else { "WRITE" };
+    let op_for_data_gen = if benchmarks_to_run.contains(&"PUBSUB") { 
+        match cli.db {
+            DbChoice::InMemory | DbChoice::RustDb => "PUBSUB_INTERNAL",
+            _ => "PUBSUB",
+        }
+    } else { "WRITE" };
     let data = PreGeneratedData::new(&cli, op_for_data_gen);
     
     let db_choices = vec![cli.db];
@@ -627,37 +855,41 @@ async fn main() -> Result<()> {
     for db_choice in db_choices {
         let db_name = format!("{:?}", db_choice);
         
-        let store: Box<dyn KvStore + Send + Sync> = match db_choice {
-            DbChoice::Redis => Box::new(RedisStore::new(&cli.redis_url).await?),
-            DbChoice::Valkey => Box::new(RedisStore::new(&cli.valkey_url).await?),
-            DbChoice::InMemory => Box::new(InMemoryStore::new()),
-            DbChoice::RustDb => Box::new(RedisStore::new(&cli.rustdb_url).await?),
+        let store_option: Option<Box<dyn KvStore + Send + Sync>> = if !benchmarks_to_run.contains(&"PUBSUB") || (db_choice == DbChoice::Redis || db_choice == DbChoice::Valkey) {
+            Some(match db_choice {
+                DbChoice::Redis => Box::new(RedisStore::new(&cli.redis_url).await?),
+                DbChoice::Valkey => Box::new(RedisStore::new(&cli.valkey_url).await?),
+                DbChoice::InMemory => Box::new(InMemoryStore::new()),
+                DbChoice::RustDb => Box::new(RedisStore::new(&cli.rustdb_url).await?),
+            })
+        } else {
+            None // No need for KvStore instance for internal PubSub
         };
 
-        if benchmarks_to_run.contains(&"READ") {
+        if benchmarks_to_run.contains(&"READ") && store_option.is_some() {
             let mut prepop_cli = cli.clone();
             prepop_cli.pipeline = true;
             prepop_cli.batch_size = cli.batch_size.max(200);
             println!("\nINFO: Pre-populating {} for READ benchmark...", db_name);
-            run_benchmark(&format!("{}-PrePop", db_name), "WRITE", store.clone(), &prepop_cli, &data, false).await?;
+            // Pre-population always uses the store
+            run_benchmark(&format!("{}-PrePop", db_name), "WRITE", store_option.as_ref().unwrap().clone(), &prepop_cli, &data, false).await?;
         }
 
         let mut results_table = Vec::new();
         for op_type_str_ref in &benchmarks_to_run {
             let actual_track_latency = track_latency_globally && !cli.pipeline;
+            
             let result = if *op_type_str_ref == "PUBSUB" {
-                let url = match db_choice {
-                    DbChoice::Redis => &cli.redis_url,
-                    DbChoice::Valkey => &cli.valkey_url,
-                    _ => {
-                        eprintln!("FATAL: PUBSUB is not supported for {:?}", db_choice);
-                        continue;
-                    }
-                };
-                run_pubsub_benchmark(&db_name, url, &cli, &data, !cli.no_latency).await
+                match db_choice {
+                    DbChoice::Redis => run_pubsub_benchmark(&db_name, &cli.redis_url, &cli, &data, !cli.no_latency).await,
+                    DbChoice::Valkey => run_pubsub_benchmark(&db_name, &cli.valkey_url, &cli, &data, !cli.no_latency).await,
+                    DbChoice::InMemory | DbChoice::RustDb => run_internal_pubsub_benchmark(&db_name, &cli, &data, !cli.no_latency).await,
+                }
             } else {
+                // Ensure store is available for non-PubSub operations
+                let store_ref = store_option.as_ref().expect("KvStore should be initialized for non-PubSub benchmarks");
                 let current_data = if *op_type_str_ref == "WRITE" { &data } else { &PreGeneratedData { keys: Arc::clone(&data.keys), values: None } };
-                run_benchmark(&db_name, op_type_str_ref, store.clone(), &cli, current_data, actual_track_latency).await
+                run_benchmark(&db_name, op_type_str_ref, store_ref.clone(), &cli, current_data, actual_track_latency).await
             };
             
             match result {
@@ -686,7 +918,11 @@ async fn main() -> Result<()> {
                 };
                 format!("READ ({:?}){}", cli.workload, zc_suffix)
             } else if *op == "PUBSUB" {
-                format!("PUBSUB ({} Pubs)", cli.num_publishers)
+                let suffix = match db_choice {
+                    DbChoice::InMemory | DbChoice::RustDb => " (Internal)".to_string(),
+                    _ => "".to_string(),
+                };
+                format!("PUBSUB ({} Pubs){}", cli.num_publishers, suffix)
             } else {
                 format!("WRITE ({:?})", cli.workload)
             };

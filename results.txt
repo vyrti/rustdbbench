@@ -13,3 +13,20 @@ Benchmarking InMemory ZERO-COPY INTERNAL BROADCAST PUBSUB (1000000 pubs, 500000 
 Database     | Op Type                  | Ops/sec        | Speed (MB/s)   | Total Traffic  | Avg Lat(ms)  | P99 Lat(ms)  | Errors  
 -------------|------------------------|----------------|----------------|----------------|--------------|--------------|----------
 InMemory     | PUBSUB (1000000 Pubs) (Internal) | 9658.74        | 119.76         | 11.547223217785358 GiB | 0.000        | 0.000        | 0
+
+concurrency:
+
+--- Connection Capacity Benchmark Results ---
+Target connections: 1
+Successfully established: 200000
+Failed to establish: 0
+Total time to establish: 28.032191645s
+Establishment Rate: 7134.65 connections/sec
+
+Holding 200000 connections open for 30s to measure stability...
+Hold period finished. Closing connections.
+
+--- Benchmark Summary (DB: WebSocket, Format: String, Workload: Connection Capacity) ---
+Database     | Op Type                  | Rate/Sec       | Speed (MB/s)   | Total Traffic  | Errors  
+-------------|------------------------|----------------|----------------|----------------|----------
+WebSocket    | WS Conn (1 Target)       | 200000.00      | 0.00           | 0 B            | 0

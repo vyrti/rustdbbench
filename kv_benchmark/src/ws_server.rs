@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, WebSocket, WebSocketUpgrade}, // Kept WebSocketUpgrade for `axum_websocket_upgrade_handler`
         State,
     },
     response::IntoResponse,
@@ -11,20 +11,27 @@ use axum::{
 use dashmap::DashMap;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{mpsc}; // Removed `broadcast` as InternalPubSub manages it
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
+use bytes::Bytes;
+use rkyv::{Archive, access, Archived, rancor::Error as RkyvError}; // Corrected: use access, Archived, RkyvError
+use crate::benchmark::pubsub::InternalPubSub;
+use crate::benchmark::data::BenchmarkPayload;
+use crate::cli::DataFormat; // Keep DataFormat, it's used in AppState.
 
 #[derive(Debug, Clone)]
 enum WsClientMessage {
     Text(String),
-    Binary(Vec<u8>),
+    Binary(Bytes),
     Pong(Vec<u8>),
 }
 
 struct WsAppState {
     client_txs: DashMap<Uuid, mpsc::Sender<WsClientMessage>>,
-    global_broadcast_tx: broadcast::Sender<WsClientMessage>,
+    internal_pubsub: Arc<InternalPubSub>,
+    cli_data_format: DataFormat,
+    cli_compress_zstd: bool,
 }
 
 async fn handle_websocket_connection(socket: WebSocket, app_state: Arc<WsAppState>) {
@@ -35,30 +42,39 @@ async fn handle_websocket_connection(socket: WebSocket, app_state: Arc<WsAppStat
     let (client_tx, mut client_rx) = mpsc::channel::<WsClientMessage>(64);
 
     app_state.client_txs.insert(client_id, client_tx.clone());
-    let mut global_broadcast_rx = app_state.global_broadcast_tx.subscribe();
+
+    let mut internal_pubsub_rx = app_state.internal_pubsub.subscribe("global_chat".to_string());
+
 
     let client_ws_tx_task = tokio::spawn(async move {
         while let Some(msg) = client_rx.recv().await {
             let tungstenite_msg = match msg {
                 WsClientMessage::Text(s) => Message::Text(s.into()),
-                WsClientMessage::Binary(b) => Message::Binary(b.into()),
+                WsClientMessage::Binary(b) => Message::Binary(b),
                 WsClientMessage::Pong(p) => Message::Pong(p.into()),
             };
             if ws_sender.send(tungstenite_msg).await.is_err() { break; }
         }
     });
 
-    let app_state_clone = Arc::clone(&app_state);
-    let client_broadcast_listener_task = tokio::spawn(async move {
+    let ws_client_tx_clone = client_tx.clone();
+    let internal_pubsub_listener_task = tokio::spawn(async move {
         loop {
-            match global_broadcast_rx.recv().await {
-                Ok(msg) => {
-                    if let Some(sender) = app_state_clone.client_txs.get(&client_id) {
-                        if sender.try_send(msg).is_err() { }
-                    } else { break; }
+            tokio::select! {
+                biased;
+                result = internal_pubsub_rx.recv() => {
+                    match result {
+                        Ok(message_arc_bytes) => {
+                            let bytes_to_send = (*message_arc_bytes).clone();
+                            if ws_client_tx_clone.send(WsClientMessage::Binary(bytes_to_send)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => eprintln!("WebSocket Client {} lagged on internal PubSub!", client_id),
+                        Err(RecvError::Closed) => break,
+                    }
                 }
-                Err(RecvError::Lagged(_)) => eprintln!("Client {} lagged!", client_id),
-                Err(RecvError::Closed) => break,
+                _ = tokio::signal::ctrl_c() => break,
             }
         }
     });
@@ -67,12 +83,19 @@ async fn handle_websocket_connection(socket: WebSocket, app_state: Arc<WsAppStat
         match result {
             Ok(msg) => match msg {
                 Message::Text(t) => {
-                    println!("Client {} sent text: {}", client_id, t);
-                    let _ = app_state.global_broadcast_tx.send(WsClientMessage::Text(format!("Client {}: {}", client_id, t)));
+                    eprintln!("Client {} sent unexpected text: {}", client_id, t);
                 }
                 Message::Binary(b) => {
-                    println!("Client {} sent binary ({} bytes)", client_id, b.len());
-                    let _ = app_state.global_broadcast_tx.send(WsClientMessage::Binary(b.to_vec()));
+                    // Corrected: Use rkyv::access for zero-copy deserialization
+                    let payload_ref = access::<Archived<BenchmarkPayload>, RkyvError>(&b)
+                                        .map(|archived| archived)
+                                        .ok();
+                    
+                    if let Some(_payload) = payload_ref {
+                        app_state.internal_pubsub.publish("global_chat".to_string(), Arc::new(b.into()));
+                    } else {
+                        eprintln!("Client {} sent invalid Rkyv binary message ({} bytes)", client_id, b.len());
+                    }
                 }
                 Message::Ping(ping_data) => {
                     if client_tx.send(WsClientMessage::Pong(ping_data.to_vec())).await.is_err() { break; }
@@ -90,33 +113,38 @@ async fn handle_websocket_connection(socket: WebSocket, app_state: Arc<WsAppStat
     app_state.client_txs.remove(&client_id);
     println!("WebSocket Client {} disconnected.", client_id);
     client_ws_tx_task.abort();
-    client_broadcast_listener_task.abort();
-}
-
-async fn axum_ws_handler(ws: WebSocketUpgrade, State(app_state): State<Arc<WsAppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_websocket_connection(socket, app_state))
+    internal_pubsub_listener_task.abort();
 }
 
 async fn axum_publish_handler(State(app_state): State<Arc<WsAppState>>, Json(payload): Json<serde_json::Value>) -> impl IntoResponse {
     let message_text = payload["message"].as_str().unwrap_or("No message provided").to_string();
-    if app_state.global_broadcast_tx.send(WsClientMessage::Text(format!("Server says: {}", message_text))).is_err() {
-        eprintln!("Failed to send message to global broadcast (no receivers).");
+    
+    app_state.internal_pubsub.publish("global_chat".to_string(), Arc::new(Bytes::from(message_text.into_bytes())));
+
+    if app_state.client_txs.is_empty() {
+        eprintln!("Failed to send message to WebSocket clients (no clients connected to server).");
         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to publish message")
     } else {
         (axum::http::StatusCode::OK, "Message published")
     }
 }
 
-pub async fn run_axum_ws_server() -> Result<()> {
-    let (global_broadcast_tx, _) = broadcast::channel::<WsClientMessage>(1024);
+// Handler for the /ws route, wrapping handle_websocket_connection
+async fn axum_websocket_upgrade_handler(ws: WebSocketUpgrade, State(app_state): State<Arc<WsAppState>>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_websocket_connection(socket, app_state))
+}
 
+
+pub async fn run_axum_ws_server(internal_pubsub: Arc<InternalPubSub>, cli_data_format: DataFormat, cli_compress_zstd: bool) -> Result<()> {
     let app_state = Arc::new(WsAppState {
         client_txs: DashMap::new(),
-        global_broadcast_tx: global_broadcast_tx.clone(),
+        internal_pubsub: internal_pubsub.clone(),
+        cli_data_format,
+        cli_compress_zstd,
     });
 
     let app = Router::new()
-        .route("/ws", get(axum_ws_handler))
+        .route("/ws", get(axum_websocket_upgrade_handler))
         .route("/publish", post(axum_publish_handler))
         .with_state(app_state.clone());
 

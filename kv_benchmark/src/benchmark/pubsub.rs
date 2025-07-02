@@ -7,18 +7,54 @@ use bitcode;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::stream::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle}; // Corrected: Added ProgressBar, ProgressStyle
 use prost::Message as ProtobufMessage;
 use rand::{prelude::*, rngs::StdRng};
 use redis::AsyncCommands;
 use rkyv::{rancor::Error as RkyvError, to_bytes};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering}; // Corrected: Added AtomicU64
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 const DEFAULT_KEY_PREFIX: &str = "bench";
+
+// New struct to encapsulate the internal Pub/Sub logic
+#[derive(Clone)]
+pub struct InternalPubSub {
+    // DashMap to hold broadcast senders for each topic/channel
+    topic_senders: Arc<DashMap<String, broadcast::Sender<Arc<Bytes>>>>,
+    // Channel size for broadcast senders
+    channel_size: usize,
+}
+
+impl InternalPubSub {
+    pub fn new(channel_size: usize) -> Self {
+        Self {
+            topic_senders: Arc::new(DashMap::new()),
+            channel_size,
+        }
+    }
+
+    // Publishes a message to a given topic. Message is Arc<Bytes> for zero-copy.
+    pub fn publish(&self, topic: String, message: Arc<Bytes>) {
+        let sender = self.topic_senders
+            .entry(topic)
+            .or_insert_with(|| broadcast::channel(self.channel_size).0); // Get or create sender
+        let _ = sender.send(message); // Ignore send errors (e.g., no receivers)
+    }
+
+    // Subscribes to a given topic. Returns a broadcast receiver.
+    pub fn subscribe(&self, topic: String) -> broadcast::Receiver<Arc<Bytes>> {
+        // Get or create sender, then subscribe
+        let sender = self.topic_senders
+            .entry(topic)
+            .or_insert_with(|| broadcast::channel(self.channel_size).0)
+            .clone();
+        sender.subscribe()
+    }
+}
 
 pub async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
     let num_publishers = cli.num_publishers;
@@ -129,10 +165,7 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
     if num_publishers == 0 { return Err(anyhow::anyhow!("Pub/Sub benchmark requires at least one publisher.")); }
     println!("\nBenchmarking {} ZERO-COPY INTERNAL BROADCAST PUBSUB ({} pubs, {} subs, {} ops total)...", db_name, num_publishers, num_subscribers, cli.num_ops);
 
-    type SharedBytes = Arc<Bytes>;
-    type TopicSenders = Arc<DashMap<String, broadcast::Sender<SharedBytes>>>;
-
-    let topic_senders: TopicSenders = Arc::new(DashMap::new());
+    let internal_pubsub = InternalPubSub::new(256); // Use a default channel size for the benchmark
     let pb = ProgressBar::new(cli.num_ops as u64);
     pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}").unwrap().progress_chars("#>-"));
     pb.set_message(format!("{} Zero-Copy PUBSUB", db_name));
@@ -144,7 +177,7 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
     let mut sub_tasks = Vec::with_capacity(num_subscribers);
 
     for _ in 0..num_subscribers {
-        let topic_senders_clone = topic_senders.clone();
+        let internal_pubsub_clone = internal_pubsub.clone();
         let keys_ref = Arc::clone(&data.keys);
         let msg_count = received_msg_count.clone();
         let bytes_count = received_bytes_count.clone();
@@ -154,10 +187,9 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
         let cli_compress_zstd = cli.compress_zstd;
 
         sub_tasks.push(tokio::spawn(async move {
-            let mut receivers: Vec<broadcast::Receiver<SharedBytes>> = Vec::new();
+            let mut receivers: Vec<broadcast::Receiver<Arc<Bytes>>> = Vec::new();
             for key in keys_ref.iter() {
-                let sender = topic_senders_clone.entry(key.clone()).or_insert_with(|| broadcast::channel(256).0).clone();
-                receivers.push(sender.subscribe());
+                receivers.push(internal_pubsub_clone.subscribe(key.clone()));
             }
             barrier.wait().await;
             let mut current_receiver_idx = 0;
@@ -166,7 +198,7 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
                     biased;
                     _ = shutdown_rx.recv() => break,
                     recv_res = async {
-                        if receivers.is_empty() { futures::future::pending::<Result<SharedBytes, RecvError>>().await }
+                        if receivers.is_empty() { futures::future::pending::<Result<Arc<Bytes>, RecvError>>().await }
                         else {
                             if current_receiver_idx >= receivers.len() { current_receiver_idx = 0; }
                             let res = receivers[current_receiver_idx].recv().await;
@@ -197,7 +229,7 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
     let mut pub_tasks = Vec::with_capacity(num_publishers);
     let ops_per_publisher = (cli.num_ops + num_publishers - 1) / num_publishers;
     for worker_id in 0..num_publishers {
-        let topic_senders_clone = topic_senders.clone();
+        let internal_pubsub_clone = internal_pubsub.clone();
         let keys_ref = Arc::clone(&data.keys);
         let cli_clone = cli.clone();
         let progress_bar_clone = pb_arc.clone();
@@ -233,13 +265,11 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
                         builder.finished_data().to_vec()
                     }
                 };
-                let value_bytes: SharedBytes = Arc::new(Bytes::from(serialized_bytes));
+                let value_bytes: Arc<Bytes> = Arc::new(Bytes::from(serialized_bytes));
                 let op_start_time = if track_latency { Some(Instant::now()) } else { None };
-                let sender = topic_senders_clone.entry(key.clone()).or_insert_with(|| broadcast::channel(256).0).clone();
-                if sender.send(value_bytes.clone()).is_ok() {
-                    local_ops_done += 1;
-                    local_bytes_written += value_bytes.len() as u64;
-                }
+                internal_pubsub_clone.publish(key.clone(), value_bytes.clone()); // Use the new publish method
+                local_ops_done += 1; // Assume publish is "successful" if it doesn't panic
+                local_bytes_written += value_bytes.len() as u64;
                 if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) { h.record(st.elapsed().as_micros() as u64).unwrap(); }
             }
             progress_bar_clone.inc((worker_end_idx - worker_start_idx) as u64);
@@ -249,7 +279,7 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
     let start_time = Instant::now();
     let publisher_results = futures::future::join_all(pub_tasks).await;
     let total_time = start_time.elapsed();
-    topic_senders.clear();
+    // internal_pubsub.clear(); // No longer needed, as InternalPubSub manages its own state lifecycle
     let _ = shutdown_tx.send(());
     pb_arc.finish_with_message("Done");
     let _ = futures::future::join_all(sub_tasks).await;
@@ -269,9 +299,10 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
             total_ops_completed += ops_per_publisher;
         }
     }
-    let total_bytes_read = received_bytes_count.load(Ordering::SeqCst);
+    let total_bytes_read_raw = received_bytes_count.load(Ordering::SeqCst);
+
     let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
-    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read })
+    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read: total_bytes_read_raw })
 }

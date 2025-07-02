@@ -23,7 +23,7 @@ use benchmark::{
     data::PreGeneratedData,
     pubsub::{run_internal_pubsub_benchmark, run_pubsub_benchmark},
     runner::run_benchmark,
-    ws::run_ws_benchmark,
+    ws::run_ws_benchmark, // Import the new WS benchmark function
 };
 use ws_server::run_axum_ws_server;
 
@@ -31,9 +31,12 @@ use ws_server::run_axum_ws_server;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.db == DbChoice::WebSocket && !cli.pubsub_only {
-        eprintln!("Error: WebSocket benchmark can only be run with the --pubsub-only flag.");
-        return Ok(());
+    // Custom logic for WebSocket benchmark mode
+    if cli.db == DbChoice::WebSocket {
+        if cli.write_only || cli.read_only || cli.pubsub_only {
+            eprintln!("Error: When --db WebSocket is chosen, other benchmark flags like --write-only, --read-only, or --pubsub-only are not applicable as it runs a dedicated connection capacity test.");
+            return Ok(());
+        }
     }
 
     if cli.run_ws_server {
@@ -41,7 +44,8 @@ async fn main() -> Result<()> {
         run_axum_ws_server().await?;
     } else {
         println!("Configuration: DB={:?}, Workload={:?}, Ops={}, Concurrency={}, Format={:?}, ValueBaseSize={}B", cli.db, cli.workload, cli.num_ops, cli.concurrency, cli.format, cli.value_size);
-        if cli.pubsub_only { println!("Pub/Sub mode: Publishers={}", cli.num_publishers); }
+        // Only print Pub/Sub specific info if it's a Pub/Sub benchmark
+        if cli.pubsub_only && cli.db != DbChoice::WebSocket { println!("Pub/Sub mode: Publishers={}", cli.num_publishers); }
         if cli.workload == Workload::Chat { println!("Chat Sim: Chats={}, HistoryLen={}, ReadSize={}", cli.num_chats, cli.history_len, cli.read_size); }
         println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, Compression={}", cli.pipeline, cli.batch_size, cli.no_latency, if cli.compress_zstd {"zstd"} else {"none"});
 
@@ -51,14 +55,20 @@ async fn main() -> Result<()> {
 
         if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
 
-        let benchmarks_to_run = match (cli.write_only, cli.read_only, cli.pubsub_only) {
-            (true, false, false) => vec!["WRITE"],
-            (false, true, false) => vec!["READ"],
-            (false, false, true) => vec!["PUBSUB"],
-            (false, false, false) => vec!["WRITE", "READ"],
-            _ => { eprintln!("Error: Please specify at most one of --write-only, --read-only, or --pubsub-only."); return Ok(()); }
+        let benchmarks_to_run = if cli.db == DbChoice::WebSocket {
+            vec!["WS_CONNECTIONS"] // Special case: only run connection test for WS DB
+        } else {
+            match (cli.write_only, cli.read_only, cli.pubsub_only) {
+                (true, false, false) => vec!["WRITE"],
+                (false, true, false) => vec!["READ"],
+                (false, false, true) => vec!["PUBSUB"],
+                (false, false, false) => vec!["WRITE", "READ"],
+                _ => { eprintln!("Error: Please specify at most one of --write-only, --read-only, or --pubsub-only for non-WebSocket benchmarks."); return Ok(()); }
+            }
         };
 
+        // Data generation is now primarily for KV/PubSub benchmarks that send/receive payloads.
+        // For WS_CONNECTIONS, the `_data` parameter to run_ws_benchmark is unused.
         let op_for_data_gen = if benchmarks_to_run.contains(&"PUBSUB") {
             match cli.db {
                 DbChoice::InMemory | DbChoice::RustDb => "PUBSUB_INTERNAL",
@@ -67,23 +77,26 @@ async fn main() -> Result<()> {
         } else { "WRITE" };
         let data = PreGeneratedData::new(&cli, op_for_data_gen);
 
-        let db_choices = vec![cli.db];
+
+        let db_choices = vec![cli.db]; // We only run one DB choice at a time based on CLI
 
         for db_choice in db_choices {
             let db_name = format!("{:?}", db_choice);
 
-            let store_option: Option<Box<dyn KvStore + Send + Sync>> = if !benchmarks_to_run.contains(&"PUBSUB") || (db_choice == DbChoice::Redis || db_choice == DbChoice::Valkey) {
+            // Only initialize KvStore trait objects if not running WebSocket capacity benchmark
+            let store_option: Option<Box<dyn KvStore + Send + Sync>> = if db_choice != DbChoice::WebSocket {
                 Some(match db_choice {
                     DbChoice::Redis => Box::new(RedisStore::new(&cli.redis_url).await?),
                     DbChoice::Valkey => Box::new(RedisStore::new(&cli.valkey_url).await?),
                     DbChoice::InMemory => Box::new(InMemoryStore::new()),
                     DbChoice::RustDb => Box::new(RedisStore::new(&cli.rustdb_url).await?),
-                    DbChoice::WebSocket => panic!("WebSocket does not implement KvStore"), // Should be unreachable
+                    DbChoice::WebSocket => unreachable!("Should be handled by separate branch for WebSocket"),
                 })
             } else {
                 None
             };
 
+            // Pre-population for READ benchmarks only applies to KV stores, not WS
             if benchmarks_to_run.contains(&"READ") && store_option.is_some() {
                 let mut prepop_cli = cli.clone();
                 prepop_cli.pipeline = true;
@@ -94,17 +107,24 @@ async fn main() -> Result<()> {
 
             let mut results_table = Vec::new();
             for op_type_str_ref in &benchmarks_to_run {
+                // Latency tracking is generally enabled unless --no-latency is passed, and for non-pipelined ops.
                 let actual_track_latency = !cli.no_latency && !cli.pipeline;
 
-                let result = if *op_type_str_ref == "PUBSUB" {
+                let result = if *op_type_str_ref == "WS_CONNECTIONS" {
+                    // Call the new WebSocket connection capacity benchmark
+                    run_ws_benchmark(&db_name, &cli.ws_url, &cli, &data, actual_track_latency).await
+                } else if *op_type_str_ref == "PUBSUB" {
+                    // Existing Pub/Sub benchmarks
                     match db_choice {
                         DbChoice::Redis => run_pubsub_benchmark(&db_name, &cli.redis_url, &cli, &data, !cli.no_latency).await,
                         DbChoice::Valkey => run_pubsub_benchmark(&db_name, &cli.valkey_url, &cli, &data, !cli.no_latency).await,
                         DbChoice::InMemory | DbChoice::RustDb => run_internal_pubsub_benchmark(&db_name, &cli, &data, !cli.no_latency).await,
-                        DbChoice::WebSocket => run_ws_benchmark(&db_name, &cli.ws_url, &cli, &data, !cli.no_latency).await,
+                        DbChoice::WebSocket => unreachable!("WS_CONNECTIONS handled above, this branch should not be reached for WebSocket DB"),
                     }
                 } else {
-                    let store_ref = store_option.as_ref().expect("KvStore should be initialized for non-PubSub benchmarks");
+                    // Existing KV store benchmarks (WRITE, READ)
+                    let store_ref = store_option.as_ref().expect("KvStore should be initialized for non-PubSub/WS benchmarks");
+                    // For READ, we typically only need keys pre-generated, not values.
                     let current_data = if *op_type_str_ref == "WRITE" { &data } else { &PreGeneratedData { keys: Arc::clone(&data.keys), values: None } };
                     run_benchmark(&db_name, op_type_str_ref, store_ref.clone(), &cli, current_data, actual_track_latency).await
                 };
@@ -125,19 +145,21 @@ async fn main() -> Result<()> {
 type ResultsData<'a> = &'a [(String, &'a str, f64, f64, Option<f64>, Option<f64>, usize, usize, u64, u64)];
 
 fn print_summary_table(db_name: &str, cli: &Cli, results_table: ResultsData, db_choice: DbChoice) {
-    let summary_workload = if cli.pubsub_only { "Pub/Sub".to_string() } else { format!("{:?}", cli.workload) };
+    let summary_workload = if cli.db == DbChoice::WebSocket { "Connection Capacity".to_string() }
+                           else if cli.pubsub_only { "Pub/Sub".to_string() }
+                           else { format!("{:?}", cli.workload) };
     println!("\n--- Benchmark Summary (DB: {}, Format: {:?}{}, Workload: {}) ---", db_name, cli.format, if cli.compress_zstd { "+zstd" } else { "" }, summary_workload);
     let show_latency_in_table = !cli.no_latency && !cli.pipeline;
-    let op_col_width = 24;
+    let op_col_width = 24; // Increased width for "WS Connections"
     if show_latency_in_table {
-        println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
+        println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Rate/Sec", "Speed (MB/s)", "Total Traffic", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
         println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<14}|{:-<14}|{:-<10}", "-", "-", "-", "-", "-", "-", "-", "-");
     } else {
-        println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Errors");
+        println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<8}", "Database", "Op Type", "Rate/Sec", "Speed (MB/s)", "Total Traffic", "Errors");
         println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<10}", "-", "-", "-", "-", "-", "-");
     }
 
-    for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, _total_ops_completed, bytes_written, bytes_read) in results_table.iter() {
+    for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, total_ops_completed, bytes_written, bytes_read) in results_table.iter() {
         let op_name = if *op == "READ" {
             let zc_suffix = match cli.format {
                 cli::DataFormat::Rkyv | cli::DataFormat::Flatbuffers => " (Zero-Copy)",
@@ -147,22 +169,32 @@ fn print_summary_table(db_name: &str, cli: &Cli, results_table: ResultsData, db_
         } else if *op == "PUBSUB" {
             let suffix = match db_choice {
                 DbChoice::InMemory | DbChoice::RustDb => " (Internal)".to_string(),
-                DbChoice::WebSocket => " (Broadcast)".to_string(),
                 _ => "".to_string(),
             };
             format!("PUBSUB ({} Pubs){}", cli.num_publishers, suffix)
+        } else if *op == "WS_CONNECTIONS" {
+            // For WS_CONNECTIONS, ops_sec is "connections established per second"
+            format!("WS Conn ({} Target)", cli.num_ops)
         } else {
             format!("WRITE ({:?})", cli.workload)
         };
 
+        // For WS_CONNECTIONS, bytes_written/read are minimal (handshake) and not primary metrics.
         let total_traffic_bytes = *bytes_written + *bytes_read;
         let traffic_speed_mb_s = if *time_s > 0.0 { (total_traffic_bytes as f64 / *time_s) / 1_000_000.0 } else { 0.0 };
         let total_traffic_str = Byte::from(total_traffic_bytes).get_appropriate_unit(UnitType::Binary).to_string();
 
-        if show_latency_in_table {
-            println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, ops_sec, traffic_speed_mb_s, total_traffic_str, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
+        let primary_rate_val = if *op == "WS_CONNECTIONS" {
+            *total_ops_completed as f64 // For connection benchmark, show total established
         } else {
-            println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<8}", db, op_name, ops_sec, traffic_speed_mb_s, total_traffic_str, errors);
+            *ops_sec
+        };
+
+
+        if show_latency_in_table {
+            println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, primary_rate_val, traffic_speed_mb_s, total_traffic_str, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
+        } else {
+            println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<8}", db, op_name, primary_rate_val, traffic_speed_mb_s, total_traffic_str, errors);
         }
     }
 }

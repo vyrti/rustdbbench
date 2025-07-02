@@ -92,7 +92,7 @@ pub async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore
                     progress_bar_clone.inc(1);
                 }
             }
-            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: local_bytes_read }
+            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: local_bytes_read, active_ws_connections: None }
         }));
     }
     let worker_results = futures::future::join_all(tasks).await;

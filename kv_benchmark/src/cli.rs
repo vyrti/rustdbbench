@@ -29,7 +29,13 @@ pub struct Cli {
     #[clap(long, default_value = "redis://127.0.0.1:7878", help="URL for the custom Rust Redis server.")]
     pub rustdb_url: String,
     #[clap(long, default_value = "ws://127.0.0.1:3000/ws", help="URL for the WebSocket server.")]
-    pub ws_url: String, // New field for WebSocket URL
+    pub ws_url: String, 
+    #[clap(long, help = "Enable multi-IP client mode for WS benchmark to overcome port limits.")]
+    pub ws_multi_ip: bool,
+    #[clap(long, default_value = "127.0.0.2", help = "Base IP address for multi-IP client mode.")]
+    pub ws_multi_ip_base: String,
+    #[clap(long, default_value_t = 200, help = "Number of IP aliases to use in multi-IP mode.")]
+    pub ws_multi_ip_count: u32,
     #[clap(long, value_enum, default_value_t = Workload::Chat, help = "The type of benchmark workload to run.")]
     pub workload: Workload,
     #[clap(short = 'o', long, default_value_t = 100_000, help="Total number of operations to perform.")]

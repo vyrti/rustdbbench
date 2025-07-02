@@ -90,7 +90,7 @@ pub async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, 
                 if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) { h.record(st.elapsed().as_micros() as u64).unwrap(); }
             }
             progress_bar_clone.inc((worker_end_idx - worker_start_idx) as u64);
-            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: 0 }
+            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: 0, active_ws_connections: None }
         }));
     }
     let publisher_results = futures::future::join_all(pub_tasks).await;
@@ -243,7 +243,7 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
                 if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) { h.record(st.elapsed().as_micros() as u64).unwrap(); }
             }
             progress_bar_clone.inc((worker_end_idx - worker_start_idx) as u64);
-            WorkerResult { histogram: hist, errors: 0, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: 0 }
+            WorkerResult { histogram: hist, errors: 0, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: 0, active_ws_connections: None }
         }));
     }
     let start_time = Instant::now();

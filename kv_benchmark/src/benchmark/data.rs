@@ -14,6 +14,8 @@ use serde::{Deserialize as SerdeDeserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zstd::stream::encode_all;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 #[derive(Serialize, SerdeDeserialize, Archive, RkyvDeserialize, RkyvSerialize, Debug, Clone)]
 pub struct BenchmarkPayload {
@@ -86,6 +88,7 @@ pub struct WorkerResult {
     pub ops_done: usize,
     pub bytes_written: u64,
     pub bytes_read: u64,
+    pub active_ws_connections: Option<Vec<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
 }
 
 pub fn generate_random_string(len: usize, rng: &mut impl Rng) -> String {

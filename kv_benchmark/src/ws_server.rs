@@ -120,7 +120,7 @@ pub async fn run_axum_ws_server() -> Result<()> {
         .route("/publish", post(axum_publish_handler))
         .with_state(app_state.clone());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("Axum WebSocket server listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 

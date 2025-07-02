@@ -14,7 +14,7 @@ pub enum Workload {
 
 #[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
 pub enum DbChoice {
-    Redis, Valkey, InMemory, RustDb,
+    Redis, Valkey, InMemory, RustDb, WebSocket,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -28,6 +28,8 @@ pub struct Cli {
     pub valkey_url: String,
     #[clap(long, default_value = "redis://127.0.0.1:7878", help="URL for the custom Rust Redis server.")]
     pub rustdb_url: String,
+    #[clap(long, default_value = "ws://127.0.0.1:3000/ws", help="URL for the WebSocket server.")]
+    pub ws_url: String,
     #[clap(long, value_enum, default_value_t = Workload::Chat, help = "The type of benchmark workload to run.")]
     pub workload: Workload,
     #[clap(short = 'o', long, default_value_t = 100_000, help="Total number of operations to perform.")]

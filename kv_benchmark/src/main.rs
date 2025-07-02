@@ -23,12 +23,18 @@ use benchmark::{
     data::PreGeneratedData,
     pubsub::{run_internal_pubsub_benchmark, run_pubsub_benchmark},
     runner::run_benchmark,
+    ws::run_ws_benchmark,
 };
 use ws_server::run_axum_ws_server;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.db == DbChoice::WebSocket && !cli.pubsub_only {
+        eprintln!("Error: WebSocket benchmark can only be run with the --pubsub-only flag.");
+        return Ok(());
+    }
 
     if cli.run_ws_server {
         println!("\n--- Starting Axum WebSocket Server ---");
@@ -40,7 +46,7 @@ async fn main() -> Result<()> {
         println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, Compression={}", cli.pipeline, cli.batch_size, cli.no_latency, if cli.compress_zstd {"zstd"} else {"none"});
 
         if cli.db != DbChoice::InMemory {
-            println!("Ensure Redis ({}), Valkey ({}), and RustDb ({}) are running", cli.redis_url, cli.valkey_url, cli.rustdb_url);
+            println!("Ensure Redis ({}), Valkey ({}), RustDb ({}) and WebSocket Server ({}) are running", cli.redis_url, cli.valkey_url, cli.rustdb_url, cli.ws_url);
         }
 
         if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
@@ -72,6 +78,7 @@ async fn main() -> Result<()> {
                     DbChoice::Valkey => Box::new(RedisStore::new(&cli.valkey_url).await?),
                     DbChoice::InMemory => Box::new(InMemoryStore::new()),
                     DbChoice::RustDb => Box::new(RedisStore::new(&cli.rustdb_url).await?),
+                    DbChoice::WebSocket => panic!("WebSocket does not implement KvStore"), // Should be unreachable
                 })
             } else {
                 None
@@ -94,6 +101,7 @@ async fn main() -> Result<()> {
                         DbChoice::Redis => run_pubsub_benchmark(&db_name, &cli.redis_url, &cli, &data, !cli.no_latency).await,
                         DbChoice::Valkey => run_pubsub_benchmark(&db_name, &cli.valkey_url, &cli, &data, !cli.no_latency).await,
                         DbChoice::InMemory | DbChoice::RustDb => run_internal_pubsub_benchmark(&db_name, &cli, &data, !cli.no_latency).await,
+                        DbChoice::WebSocket => run_ws_benchmark(&db_name, &cli.ws_url, &cli, &data, !cli.no_latency).await,
                     }
                 } else {
                     let store_ref = store_option.as_ref().expect("KvStore should be initialized for non-PubSub benchmarks");
@@ -139,6 +147,7 @@ fn print_summary_table(db_name: &str, cli: &Cli, results_table: ResultsData, db_
         } else if *op == "PUBSUB" {
             let suffix = match db_choice {
                 DbChoice::InMemory | DbChoice::RustDb => " (Internal)".to_string(),
+                DbChoice::WebSocket => " (Broadcast)".to_string(),
                 _ => "".to_string(),
             };
             format!("PUBSUB ({} Pubs){}", cli.num_publishers, suffix)

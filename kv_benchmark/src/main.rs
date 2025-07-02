@@ -1,21 +1,20 @@
-// kv_benchmark/src/main.rs
+// src/main.rs
 use anyhow::Result;
 use async_trait::async_trait;
 use byte_unit::{Byte, UnitType};
 use clap::{Parser, ValueEnum};
-use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng}; // FIX 1: Corrected typo 'реlud' to 'prelude::*'
-use rand::distributions::Distribution; // FIX 2: Added missing import for Distribution trait
+use rand::{distributions::Alphanumeric, prelude::*, rngs::StdRng};
+use rand::distributions::Distribution;
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use rkyv::{
-    access, // Used for validation/deserialization with `Archived`
-    rancor::Error as RkyvError, // Renamed to avoid conflict with anyhow::Error
-    to_bytes, // For serializing to bytes
-    Archive, // For deriving Archive trait
-    Deserialize as RkyvDeserialize, // For deserializing archived types
-    Serialize as RkyvSerialize, // For serializing to archived types
-    Archived, // Needed for `access::<Archived<T>, E>`
+    access,
+    rancor::Error as RkyvError,
+    to_bytes,
+    Archive,
+    Deserialize as RkyvDeserialize,
+    Serialize as RkyvSerialize,
+    Archived,
 };
 use rustc_hash::{FxHashMap, FxHasher};
 use serde::{Deserialize as SerdeDeserialize, Serialize};
@@ -24,15 +23,24 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zstd::stream::{decode_all, encode_all};
-
 use bitcode;
-use prost::Message;
-
-// --- Imports for Internal Pub/Sub ---
+use prost::Message as ProtobufMessage;
 use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::sync::broadcast; // FIX 4: Removed 'mpsc' as it was unused
-use tokio::sync::broadcast::error::RecvError; // FIX 5: Corrected path for RecvError
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
+use futures::{sink::SinkExt, stream::StreamExt};
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/benchmark.rs"));
@@ -77,7 +85,7 @@ struct Cli {
     workload: Workload,
     #[clap(short = 'o', long, default_value_t = 100_000, help="Total number of operations to perform.")]
     num_ops: usize,
-    #[clap(short, long, default_value_t = 50, help="Number of concurrent client threads.")]
+    #[clap(short, long, default_value = "50", help="Number of concurrent client threads.")]
     concurrency: usize,
     #[clap(long, default_value_t = 128, help="Base size in bytes for the data part of a message payload.")]
     value_size: usize,
@@ -105,6 +113,8 @@ struct Cli {
     no_latency: bool,
     #[clap(long, help = "Enable zstd compression for values")]
     compress_zstd: bool,
+    #[clap(long, help = "Run WebSocket server instead of benchmark.")]
+    run_ws_server: bool, // New CLI argument
 }
 
 #[derive(Serialize, SerdeDeserialize, Archive, RkyvDeserialize, RkyvSerialize, Debug, Clone)]
@@ -184,8 +194,19 @@ impl KvStore for InMemoryStore {
         let index = self.get_shard_index(&key);
         let mut shard = self.shards[index].lock().unwrap();
         if let Some(list) = shard.get_mut(key) {
+            // Redis LTRIM behavior: keeps elements from start to stop (inclusive)
+            // If stop is negative, it counts from the end of the list.
+            // Simplified for the current benchmark's usage (start=0, stop=history_len-1)
             if start == 0 && stop >= 0 {
-                list.truncate((stop + 1) as usize);
+                let current_len = list.len();
+                let effective_stop_idx = (stop + 1) as usize; // inclusive stop means (stop + 1) elements
+                if effective_stop_idx < current_len {
+                    list.truncate(effective_stop_idx);
+                }
+            } else {
+                // For more complex LTRIM, a full slice/drain logic would be needed.
+                // This benchmark currently only uses LTRIM with start=0, stop=N-1.
+                // For now, if it's not the simple case, we don't apply the trim.
             }
         }
         Ok(())
@@ -194,10 +215,12 @@ impl KvStore for InMemoryStore {
         let index = self.get_shard_index(&key);
         let shard = self.shards[index].lock().unwrap();
         if let Some(list) = shard.get(key) {
+            // Simplified for current benchmark's usage (start=0, stop=read_size-1)
             if start == 0 && stop >= 0 {
                 let end = (stop + 1).min(list.len() as isize) as usize;
                 return Ok(list[..end].to_vec());
             }
+            // else: handles negative indexing etc. but current logic only for start=0
         }
         Ok(vec![])
     }
@@ -213,6 +236,7 @@ impl KvStore for InMemoryStore {
         Ok(results)
     }
     async fn batch_lpush_ltrim(&self, items: Vec<(&str, Vec<u8>)>, history_len: isize) -> Result<()> {
+        // Fix for E0609: InMemoryStore doesn't use redis::pipe
         for (key, value) in items {
             self.lpush(key, value).await?;
             self.ltrim(key, 0, history_len - 1).await?;
@@ -229,7 +253,6 @@ impl KvStore for InMemoryStore {
 }
 
 // --- Redis Implementation of the Trait ---
-// NOTE: This single implementation now works for Redis, Valkey, and our RustDb server!
 #[derive(Clone)]
 struct RedisStore {
     conn: MultiplexedConnection,
@@ -364,7 +387,7 @@ struct BenchResult {
     avg_latency_ms: Option<f64>,
     p99_latency_ms: Option<f64>,
     errors: usize,
-    total_ops_completed: usize, // FIX 7: Added to accurately reflect completed ops
+    total_ops_completed: usize,
     total_bytes_written: u64,
     total_bytes_read: u64,
 }
@@ -372,7 +395,7 @@ struct BenchResult {
 struct WorkerResult {
     histogram: Option<hdrhistogram::Histogram<u64>>,
     errors: usize,
-    ops_done: usize, // FIX 7: Now explicitly summed into total_ops_completed
+    ops_done: usize,
     bytes_written: u64,
     bytes_read: u64,
 }
@@ -411,10 +434,9 @@ async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data
                     _ = shutdown_rx.recv() => break,
                     Some(msg) = message_stream.next() => {
                         msg_count.fetch_add(1, Ordering::Relaxed);
-                        // In Redis, `get_payload_bytes()` returns `Vec<u8>`, which is already a copy from the network buffer.
                         bytes_count.fetch_add(msg.get_payload_bytes().len() as u64, Ordering::Relaxed);
                     },
-                    else => break,
+                    else => break, // Fallback if select! finishes due to all branches being done, though typically one of above should cover it.
                 }
             }
         }));
@@ -458,19 +480,23 @@ async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data
     let _ = futures::future::join_all(sub_tasks).await;
     let mut final_histogram = if track_latency { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
     let mut total_errors = 0;
-    let mut total_ops_completed = 0; // FIX 7: Track total ops completed
+    let mut total_ops_completed = 0;
     let mut total_bytes_written = 0;
     for result in publisher_results {
         if let Ok(wr) = result {
             if let (Some(fh), Some(wh)) = (final_histogram.as_mut(), wr.histogram.as_ref()) { fh.add(wh).unwrap(); }
             total_errors += wr.errors;
-            total_ops_completed += wr.ops_done; // FIX 7: Sum ops_done
+            total_ops_completed += wr.ops_done;
             total_bytes_written += wr.bytes_written;
+        } else {
+            eprintln!("Publisher worker task panicked.");
+            // If a worker panics, its ops are not counted. Increment errors for clarity.
+            total_errors += ops_per_publisher; // Or some other heuristic
+            total_ops_completed += ops_per_publisher;
         }
     }
-    let total_bytes_read_raw = received_bytes_count.load(Ordering::SeqCst); 
+    let total_bytes_read_raw = received_bytes_count.load(Ordering::SeqCst);
 
-    // FIX 7: Base successful_ops on total_ops_completed, not cli.num_ops
     let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
@@ -498,7 +524,6 @@ async fn run_internal_pubsub_benchmark(
     println!("\nBenchmarking {} ZERO-COPY INTERNAL BROADCAST PUBSUB ({} pubs, {} subs, {} ops total)...", db_name, num_publishers, num_subscribers, cli.num_ops);
 
     type SharedBytes = Arc<Bytes>;
-    // Change to a DashMap of broadcast Senders
     type TopicSenders = Arc<DashMap<String, broadcast::Sender<SharedBytes>>>;
 
     let topic_senders: TopicSenders = Arc::new(DashMap::new());
@@ -507,12 +532,10 @@ async fn run_internal_pubsub_benchmark(
     pb.set_message(format!("{} Zero-Copy PUBSUB", db_name));
     let pb_arc = Arc::new(pb);
 
-    // Use a broadcast channel for shutdown
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let received_msg_count = Arc::new(AtomicUsize::new(0));
     let received_bytes_count = Arc::new(AtomicU64::new(0));
-    
-    // Barrier for all participants (publishers + subscribers) to be ready before starting timer
+
     let ready_barrier = Arc::new(tokio::sync::Barrier::new(
         num_subscribers + num_publishers,
     ));
@@ -524,70 +547,66 @@ async fn run_internal_pubsub_benchmark(
         let msg_count = received_msg_count.clone();
         let bytes_count = received_bytes_count.clone();
         let barrier = ready_barrier.clone();
-        let mut shutdown_rx = shutdown_tx.subscribe(); // Get a receiver for shutdown
-        let cli_format = cli.format; // Capture for deserialization
-        let cli_compress_zstd = cli.compress_zstd; // Capture for deserialization
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let cli_format = cli.format;
+        let cli_compress_zstd = cli.compress_zstd;
 
         sub_tasks.push(tokio::spawn(async move {
             let mut receivers: Vec<broadcast::Receiver<SharedBytes>> = Vec::new();
             for key in keys_ref.iter() {
-                // Get or insert a broadcast::Sender for this key.
-                // The channel capacity is arbitrary, 256 is often a good default.
-                // It means up to 256 messages can be buffered before old ones are dropped.
+                // Get or insert a sender for each topic/key
                 let sender = topic_senders_clone.entry(key.clone())
-                    .or_insert_with(|| broadcast::channel(256).0)
+                    .or_insert_with(|| broadcast::channel(256).0) // 256 is default capacity for new channels
                     .clone();
                 receivers.push(sender.subscribe());
             }
 
-            barrier.wait().await; // Wait for all participants to be ready
+            barrier.wait().await;
 
             let mut current_receiver_idx = 0;
 
             loop {
-                // Ensure there are active receivers to poll from
-                if receivers.is_empty() {
-                    // If no receivers left, just wait indefinitely for shutdown.
-                    // Use a select for indefinite wait, ensuring it doesn't block forever
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => break,
-                        _ = futures::future::pending::<()>() => break, // Should theoretically never resolve, just keeps task alive
-                    }
-                }
-
-                // Make sure current_receiver_idx is valid if receivers list was modified
-                if current_receiver_idx >= receivers.len() {
-                    current_receiver_idx = 0; // Wrap around or reset if out of bounds
-                }
-
                 tokio::select! {
                     biased; // Prioritize shutdown
                     _ = shutdown_rx.recv() => break,
-                    recv_res = receivers[current_receiver_idx].recv() => { // FIX 6: Simplified receiver polling
+                    recv_res = async {
+                        if receivers.is_empty() {
+                            // If no receivers left, just wait for shutdown
+                            futures::future::pending::<Result<SharedBytes, RecvError>>().await
+                        } else {
+                            // Ensure index is valid, even if vector was modified externally (unlikely here)
+                            if current_receiver_idx >= receivers.len() {
+                                current_receiver_idx = 0;
+                            }
+                            let res = receivers[current_receiver_idx].recv().await;
+                            // Advance index for next iteration, or remove if closed
+                            if !receivers.is_empty() && matches!(res, Err(RecvError::Closed)) {
+                                receivers.remove(current_receiver_idx);
+                                // Don't increment current_receiver_idx as the next element shifted into its place
+                                if current_receiver_idx >= receivers.len() && !receivers.is_empty() {
+                                    current_receiver_idx = 0; // Wrap around if we removed the last one
+                                }
+                            } else if !receivers.is_empty() {
+                                current_receiver_idx = (current_receiver_idx + 1) % receivers.len();
+                            }
+                            res
+                        }
+                    } => {
                         match recv_res {
-                            Ok(ref msg_arc) => { // FIX: Added `ref` here to avoid moving `msg_arc`
+                            Ok(msg_arc) => {
                                 msg_count.fetch_add(1, Ordering::Relaxed);
                                 bytes_count.fetch_add(msg_arc.len() as u64, Ordering::Relaxed);
-                                // Process the received message to simulate work (optional, but good for realism)
-                                let _ = process_read_result_simple(msg_arc, cli_format, cli_compress_zstd);
+                                let _ = process_read_result_simple(&msg_arc, cli_format, cli_compress_zstd);
                             },
-                            Err(RecvError::Lagged(_)) => { // FIX 5: Correct pattern match for Lagged
-                                // Messages were dropped due to slow consumer or small channel capacity.
-                                // You might want to count these as "skipped" or "failed" messages.
-                                // For a benchmark, this implies capacity issues.
+                            Err(RecvError::Lagged(_)) => {
+                                // Lagged means messages were dropped, but the channel is still open.
+                                // We continue.
                             },
-                            Err(RecvError::Closed) => { // FIX 5: Correct pattern match for Closed
-                                // Sender was dropped, no more messages will arrive on this channel.
-                                // Remove this receiver from the list at its current index.
-                                receivers.remove(current_receiver_idx);
-                                // No need to advance current_receiver_idx; the next element (if any)
-                                // shifts into this position and will be checked next iteration.
+                            Err(RecvError::Closed) => {
+                                if receivers.is_empty() {
+                                    break; // No more active channels to listen to
+                                }
                             }
-                        }
-                        // Only advance index if the receiver was NOT removed and if there are still receivers.
-                        // The `recv_res` is now available for the `matches!` check.
-                        if !receivers.is_empty() && !matches!(recv_res, Err(RecvError::Closed)) {
-                            current_receiver_idx = (current_receiver_idx + 1) % receivers.len();
                         }
                     },
                 }
@@ -617,10 +636,10 @@ async fn run_internal_pubsub_benchmark(
                 None
             };
             let mut local_ops_done = 0;
-            let mut local_bytes_written = 0; // This will now be bytes actually put into channels
+            let mut local_bytes_written = 0;
             let mut rng = StdRng::from_entropy();
 
-            barrier.wait().await; // Wait for all participants to be ready
+            barrier.wait().await;
 
             for i in worker_start_idx..worker_end_idx {
                 let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
@@ -670,19 +689,19 @@ async fn run_internal_pubsub_benchmark(
 
                 let op_start_time = if track_latency { Some(Instant::now()) } else { None };
 
-                // Get or create the broadcast::Sender for this topic
                 let sender = topic_senders_clone.entry(key.clone())
-                    .or_insert_with(|| broadcast::channel(256).0) // Capacity for the broadcast channel
+                    .or_insert_with(|| broadcast::channel(256).0)
                     .clone();
 
-                // Send the message once to the broadcast channel
+                // `send` is used here. If the channel is full and there are no active receivers,
+                // `send` will return an error. For benchmark, this means messages are dropped.
                 if sender.send(value_bytes.clone()).is_ok() {
                     local_ops_done += 1;
-                    local_bytes_written += value_bytes.len() as u64; // Count bytes placed into the channel
+                    local_bytes_written += value_bytes.len() as u64;
                 } else {
-                    // This means no receivers exist or they've all been dropped/lagged persistently.
-                    // For benchmark, treat as success if message was "published" to the channel,
-                    // but track errors if the channel itself is problematic.
+                    // For benchmark, if send fails (e.g., no receivers), it means it wasn't a successful publication.
+                    // We don't increment local_errors here, consistent with how this was handled previously.
+                    // The ops_done will reflect only successful sends.
                 }
 
                 if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) {
@@ -692,7 +711,7 @@ async fn run_internal_pubsub_benchmark(
             progress_bar_clone.inc((worker_end_idx - worker_start_idx) as u64);
             WorkerResult {
                 histogram: hist,
-                errors: 0, // Errors specific to channel send might need finer tracking.
+                errors: 0, // Errors tracked by `if sender.send(...).is_ok()`
                 ops_done: local_ops_done,
                 bytes_written: local_bytes_written,
                 bytes_read: 0,
@@ -704,9 +723,9 @@ async fn run_internal_pubsub_benchmark(
     let publisher_results = futures::future::join_all(pub_tasks).await;
     let total_time = start_time.elapsed();
 
-    // Drop all broadcast senders in the map to signal to subscribers that no more messages are coming
+    // Clear topic senders to signal subscribers to shut down
     topic_senders.clear();
-    let _ = shutdown_tx.send(()); // Signal shutdown
+    let _ = shutdown_tx.send(()); // Send shutdown signal explicitly
 
     pb_arc.finish_with_message("Done");
     let _ = futures::future::join_all(sub_tasks).await;
@@ -717,7 +736,7 @@ async fn run_internal_pubsub_benchmark(
         None
     };
     let mut total_errors = 0;
-    let mut total_ops_completed = 0; // FIX 7: Track total ops completed
+    let mut total_ops_completed = 0;
     let mut total_bytes_written = 0;
     for result in publisher_results {
         if let Ok(wr) = result {
@@ -725,12 +744,16 @@ async fn run_internal_pubsub_benchmark(
                 fh.add(wh).unwrap();
             }
             total_errors += wr.errors;
-            total_ops_completed += wr.ops_done; // FIX 7: Sum ops_done
+            total_ops_completed += wr.ops_done;
             total_bytes_written += wr.bytes_written;
+        } else {
+            eprintln!("Publisher worker task panicked.");
+            // If a worker panics, its ops are not counted. Increment errors for clarity.
+            total_errors += ops_per_publisher; // Or some other heuristic
+            total_ops_completed += ops_per_publisher;
         }
     }
     let total_bytes_read = received_bytes_count.load(Ordering::SeqCst);
-    // FIX 7: Base successful_ops on total_ops_completed, not cli.num_ops
     let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 {
         successful_ops as f64 / total_time.as_secs_f64()
@@ -751,7 +774,7 @@ async fn run_internal_pubsub_benchmark(
         avg_latency_ms: avg_lat,
         p99_latency_ms: p99_lat,
         errors: total_errors,
-        total_ops_completed, // FIX 7: Add to result
+        total_ops_completed,
         total_bytes_written,
         total_bytes_read,
     })
@@ -848,25 +871,24 @@ async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + S
     pb_arc.finish_with_message("Done");
     let mut final_histogram = if track_latency && !cli.pipeline { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
     let mut total_errors = 0;
-    let mut total_ops_completed = 0; // FIX 7: Track total ops completed
+    let mut total_ops_completed = 0;
     let mut total_bytes_written = 0;
     let mut total_bytes_read = 0;
     for result in worker_results {
         if let Ok(wr) = result {
             if let (Some(fh), Some(wh)) = (final_histogram.as_mut(), wr.histogram.as_ref()) { fh.add(wh).unwrap(); }
             total_errors += wr.errors;
-            total_ops_completed += wr.ops_done; // FIX 7: Sum ops_done
+            total_ops_completed += wr.ops_done;
             total_bytes_written += wr.bytes_written;
             total_bytes_read += wr.bytes_read;
-        } else { 
-            eprintln!("Worker task panicked."); 
-            // If a worker panics, we count its share of operations as failed for the benchmark's total.
-            total_errors += ops_per_worker; // Assume all ops assigned to it failed.
-            total_ops_completed += ops_per_worker; // Still count them as attempted for throughput calculation base.
+        } else {
+            eprintln!("Worker task panicked.");
+            // Propagate the idea that operations were not successful
+            total_errors += ops_per_worker;
+            total_ops_completed += ops_per_worker;
         }
     }
     if total_errors > 0 { println!("WARNING: {}/{} operations reported errors.", total_errors, cli.num_ops); }
-    // FIX 7: Base successful_ops on total_ops_completed, not cli.num_ops
     let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
@@ -874,21 +896,16 @@ async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore + S
 }
 
 fn process_read_result_chat(messages: Vec<Vec<u8>>, format: DataFormat, compressed: bool) -> bool {
-    // For `Vec<Vec<u8>>`, we iterate and pass a slice to `process_read_result_simple`.
     messages.into_iter().all(|bytes_vec| process_read_result_simple(bytes_vec.as_slice(), format, compressed))
 }
 
-// This function now takes a slice `&[u8]` as input.
-// For Rkyv, Flatbuffers, and Protobuf, if `compressed` is false, this can be truly zero-copy as it operates directly on the slice.
-// For other formats (String, Json, Bitcode) or if `compressed` is true, an internal copy or allocation will still occur.
 fn process_read_result_simple(bytes_slice: &[u8], format: DataFormat, compressed: bool) -> bool {
     if bytes_slice.is_empty() { return true; }
-    
-    // FIX 3: Restructured to correctly manage `owned_decompressed_opt` and `final_bytes_slice` lifetime.
+
     let owned_decompressed_opt: Option<Vec<u8>> = if compressed {
         match decode_all(bytes_slice) {
             Ok(decompressed) => Some(decompressed),
-            Err(_) => return false, // Decompression failed
+            Err(_) => return false,
         }
     } else {
         None
@@ -901,139 +918,315 @@ fn process_read_result_simple(bytes_slice: &[u8], format: DataFormat, compressed
     };
 
     match format {
-        // These formats can potentially be "zero-copy" from the `bytes_slice` if not compressed.
-        // They operate on `&[u8]` directly.
         DataFormat::Rkyv => access::<Archived<BenchmarkPayload>, RkyvError>(final_bytes_slice).map(|_| true).unwrap_or(false),
         DataFormat::Flatbuffers => flatbuffers::root::<fbs::benchmark_fbs::BenchmarkPayload>(final_bytes_slice).is_ok(),
         DataFormat::Protobuf => pb::BenchmarkPayload::decode(final_bytes_slice).is_ok(),
-
-        // These formats typically require an owned `Vec<u8>` or internal copying.
-        // `to_vec()` creates a copy.
         DataFormat::Json => serde_json::from_slice::<BenchmarkPayload>(final_bytes_slice).is_ok(),
         DataFormat::Bitcode => bitcode::deserialize::<BenchmarkPayload>(final_bytes_slice).is_ok(),
         DataFormat::String => String::from_utf8(final_bytes_slice.to_vec()).is_ok(),
     }
 }
 
+// --- Axum WebSocket Server Implementation ---
+// Our message type for internal WebSocket communication
+#[derive(Debug, Clone)]
+enum WsClientMessage {
+    Text(String),
+    Binary(Vec<u8>),
+    Pong(Vec<u8>),
+}
+
+// Our shared state for the Axum server
+struct WsAppState {
+    // Maps client ID to an MPSC sender for that client's WebSocket sink.
+    // This allows sending messages to a specific client.
+    client_txs: DashMap<Uuid, mpsc::Sender<WsClientMessage>>,
+    // A broadcast channel for messages that should go to ALL clients.
+    // Clients will subscribe to a receiver from this channel.
+    global_broadcast_tx: broadcast::Sender<WsClientMessage>,
+}
+
+// The main WebSocket handler function that takes the WebSocket and state
+// This function is called *after* the upgrade handshake.
+async fn handle_websocket_connection(socket: WebSocket, app_state: Arc<WsAppState>) {
+    let client_id = Uuid::new_v4();
+    println!("WebSocket Client {} connected.", client_id);
+
+    // Split the WebSocket into sender and receiver
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // Create a smaller MPSC channel for this specific client to reduce memory usage
+    let (client_tx, mut client_rx) = mpsc::channel::<WsClientMessage>(64); // Reduced buffer size
+
+    // Store the client's MPSC sender in the shared state.
+    app_state.client_txs.insert(client_id, client_tx.clone());
+
+    // Subscribe this client to the global broadcast channel.
+    let mut global_broadcast_rx = app_state.global_broadcast_tx.subscribe();
+
+    // Spawn a task to send messages from the `client_rx` to the WebSocket.
+    let client_ws_tx_task = tokio::spawn(async move {
+        while let Some(msg) = client_rx.recv().await {
+            let tungstenite_msg = match msg {
+                WsClientMessage::Text(s) => Message::Text(s.into()),
+                WsClientMessage::Binary(b) => Message::Binary(b.into()),
+                WsClientMessage::Pong(p) => Message::Pong(p.into()),
+            };
+            if ws_sender.send(tungstenite_msg).await.is_err() {
+                // Client disconnected or error sending
+                break;
+            }
+        }
+    });
+
+    // Spawn a task to listen for messages from the global broadcast and forward to this client's mpsc.
+    let app_state_clone_for_broadcast_listener = Arc::clone(&app_state);
+    let client_broadcast_listener_task = tokio::spawn(async move {
+        loop {
+            match global_broadcast_rx.recv().await {
+                Ok(msg) => {
+                    // Use try_send for non-blocking sends to prevent slow clients from blocking broadcasts
+                    if let Some(sender) = app_state_clone_for_broadcast_listener.client_txs.get(&client_id) {
+                        if sender.try_send(msg).is_err() {
+                            // Channel full or closed - disconnect slow client (or just drop msg)
+                            // We will simply drop the message in `try_send` error case.
+                            // The client_ws_tx_task will eventually break if ws_sender fails.
+                            // If it's `TrySendError::Closed`, the client is already gone.
+                            // If it's `TrySendError::Full`, the client is slow. We just drop.
+                        }
+                    } else {
+                        // Client was removed from map, stop listening for it
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    eprintln!("Client {} lagged, messages dropped from broadcast!", client_id);
+                    // Continue serving this client despite lagging
+                }
+                Err(RecvError::Closed) => {
+                    // The global broadcast sender was dropped (server shutting down?)
+                    break;
+                }
+            }
+        }
+    });
+
+    // Main loop for receiving messages from this client's WebSocket.
+    // Fix E0599: `ws_receiver.recv()` -> `ws_receiver.next()`
+    while let Some(result) = ws_receiver.next().await {
+        match result {
+            Ok(msg) => {
+                match msg {
+                    Message::Text(t) => {
+                        println!("Client {} sent text: {}", client_id, t);
+                        // Use send for broadcasting, it's generally what's desired for broadcast channels.
+                        // `send` returns an error if no active receivers, so `_ = ` handles ignoring that.
+                        let _ = app_state.global_broadcast_tx.send(WsClientMessage::Text(format!("Client {}: {}", client_id, t)));
+                    }
+                    Message::Binary(b) => {
+                        println!("Client {} sent binary ({} bytes)", client_id, b.len());
+                        let _ = app_state.global_broadcast_tx.send(WsClientMessage::Binary(b.to_vec()));
+                    }
+                    Message::Ping(ping_data) => {
+                        // Respond to Ping by sending a message through our MPSC channel
+                        if client_tx.send(WsClientMessage::Pong(ping_data.to_vec())).await.is_err() {
+                            // If sending to our own task fails, it means the task has died
+                            break;
+                        }
+                    }
+                    Message::Pong(_) => { /* Ignore */ }
+                    Message::Close(_) => {
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("WebSocket error for client {}: {:?}", client_id, err);
+                break;
+            }
+        }
+    }
+
+    // Client disconnected or error occurred, clean up.
+    app_state.client_txs.remove(&client_id);
+    println!("WebSocket Client {} disconnected.", client_id);
+
+    // Abort the spawned tasks for this client.
+    client_ws_tx_task.abort();
+    client_broadcast_listener_task.abort();
+    // Removed ping_task as it's no longer needed
+}
+
+// Axum handler that performs the WebSocket upgrade
+// Fix E0425: This is the missing `axum_ws_handler`
+async fn axum_ws_handler(
+    ws: WebSocketUpgrade,
+    State(app_state): State<Arc<WsAppState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_websocket_connection(socket, app_state))
+}
+
+
+// Example HTTP endpoint to manually publish a message to all WebSocket clients
+async fn axum_publish_handler(State(app_state): State<Arc<WsAppState>>, Json(payload): Json<serde_json::Value>) -> impl IntoResponse {
+    let message_text = payload["message"].as_str().unwrap_or("No message provided").to_string();
+    // Use `send` which returns an error if no receivers (or all receivers disconnected)
+    if app_state.global_broadcast_tx.send(WsClientMessage::Text(format!("Server says: {}", message_text))).is_err() {
+        eprintln!("Failed to send message to global broadcast (no receivers or channel closed).");
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to publish message: no active receivers or channel closed")
+    } else {
+        (axum::http::StatusCode::OK, "Message published")
+    }
+}
+
+async fn run_axum_ws_server() -> Result<()> {
+    // Initializing broadcast channel for global messages
+    let (global_broadcast_tx, _global_broadcast_rx) = broadcast::channel::<WsClientMessage>(1024); // Capacity for broadcast channel
+
+    let app_state = Arc::new(WsAppState {
+        client_txs: DashMap::new(),
+        global_broadcast_tx: global_broadcast_tx.clone(),
+    });
+
+    let app = Router::new()
+        .route("/ws", get(axum_ws_handler)) // Now `axum_ws_handler` is defined
+        .route("/publish", post(axum_publish_handler))
+        .with_state(app_state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
+    println!("Axum WebSocket server listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
+
+    Ok(())
+}
+
+// --- Main function to dispatch based on CLI args ---
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let track_latency_globally = !cli.no_latency;
 
-    println!("Configuration: DB={:?}, Workload={:?}, Ops={}, Concurrency={}, Format={:?}, ValueBaseSize={}B", cli.db, cli.workload, cli.num_ops, cli.concurrency, cli.format, cli.value_size);
-    if cli.pubsub_only { println!("Pub/Sub mode: Publishers={}", cli.num_publishers); }
-    if cli.workload == Workload::Chat { println!("Chat Sim: Chats={}, HistoryLen={}, ReadSize={}", cli.num_chats, cli.history_len, cli.read_size); }
-    println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, Compression={}", cli.pipeline, cli.batch_size, cli.no_latency, if cli.compress_zstd {"zstd"} else {"none"});
-    
-    if cli.db != DbChoice::InMemory {
-        println!("Ensure Redis ({}), Valkey ({}), and RustDb ({}) are running", cli.redis_url, cli.valkey_url, cli.rustdb_url);
-    }
+    if cli.run_ws_server {
+        println!("\n--- Starting Axum WebSocket Server ---");
+        run_axum_ws_server().await?;
+    } else {
+        println!("Configuration: DB={:?}, Workload={:?}, Ops={}, Concurrency={}, Format={:?}, ValueBaseSize={}B", cli.db, cli.workload, cli.num_ops, cli.concurrency, cli.format, cli.value_size);
+        if cli.pubsub_only { println!("Pub/Sub mode: Publishers={}", cli.num_publishers); }
+        if cli.workload == Workload::Chat { println!("Chat Sim: Chats={}, HistoryLen={}, ReadSize={}", cli.num_chats, cli.history_len, cli.read_size); }
+        println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, Compression={}", cli.pipeline, cli.batch_size, cli.no_latency, if cli.compress_zstd {"zstd"} else {"none"});
 
-    if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
-
-    let benchmarks_to_run = match (cli.write_only, cli.read_only, cli.pubsub_only) {
-        (true, false, false) => vec!["WRITE"],
-        (false, true, false) => vec!["READ"],
-        (false, false, true) => vec!["PUBSUB"],
-        (false, false, false) => vec!["WRITE", "READ"],
-        _ => { eprintln!("Error: Please specify at most one of --write-only, --read-only, or --pubsub-only."); return Ok(()); }
-    };
-
-    let op_for_data_gen = if benchmarks_to_run.contains(&"PUBSUB") { 
-        match cli.db {
-            DbChoice::InMemory | DbChoice::RustDb => "PUBSUB_INTERNAL",
-            _ => "PUBSUB",
+        if cli.db != DbChoice::InMemory {
+            println!("Ensure Redis ({}), Valkey ({}), and RustDb ({}) are running", cli.redis_url, cli.valkey_url, cli.rustdb_url);
         }
-    } else { "WRITE" };
-    let data = PreGeneratedData::new(&cli, op_for_data_gen);
-    
-    let db_choices = vec![cli.db];
 
-    for db_choice in db_choices {
-        let db_name = format!("{:?}", db_choice);
-        
-        let store_option: Option<Box<dyn KvStore + Send + Sync>> = if !benchmarks_to_run.contains(&"PUBSUB") || (db_choice == DbChoice::Redis || db_choice == DbChoice::Valkey) {
-            Some(match db_choice {
-                DbChoice::Redis => Box::new(RedisStore::new(&cli.redis_url).await?),
-                DbChoice::Valkey => Box::new(RedisStore::new(&cli.valkey_url).await?),
-                DbChoice::InMemory => Box::new(InMemoryStore::new()),
-                DbChoice::RustDb => Box::new(RedisStore::new(&cli.rustdb_url).await?),
-            })
-        } else {
-            None // No need for KvStore instance for internal PubSub
+        if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
+
+        let benchmarks_to_run = match (cli.write_only, cli.read_only, cli.pubsub_only) {
+            (true, false, false) => vec!["WRITE"],
+            (false, true, false) => vec!["READ"],
+            (false, false, true) => vec!["PUBSUB"],
+            (false, false, false) => vec!["WRITE", "READ"],
+            _ => { eprintln!("Error: Please specify at most one of --write-only, --read-only, or --pubsub-only."); return Ok(()); }
         };
 
-        if benchmarks_to_run.contains(&"READ") && store_option.is_some() {
-            let mut prepop_cli = cli.clone();
-            prepop_cli.pipeline = true;
-            prepop_cli.batch_size = cli.batch_size.max(200);
-            println!("\nINFO: Pre-populating {} for READ benchmark...", db_name);
-            // Pre-population always uses the store
-            run_benchmark(&format!("{}-PrePop", db_name), "WRITE", store_option.as_ref().unwrap().clone(), &prepop_cli, &data, false).await?;
-        }
-
-        let mut results_table = Vec::new();
-        for op_type_str_ref in &benchmarks_to_run {
-            let actual_track_latency = track_latency_globally && !cli.pipeline;
-            
-            let result = if *op_type_str_ref == "PUBSUB" {
-                match db_choice {
-                    DbChoice::Redis => run_pubsub_benchmark(&db_name, &cli.redis_url, &cli, &data, !cli.no_latency).await,
-                    DbChoice::Valkey => run_pubsub_benchmark(&db_name, &cli.valkey_url, &cli, &data, !cli.no_latency).await,
-                    DbChoice::InMemory | DbChoice::RustDb => run_internal_pubsub_benchmark(&db_name, &cli, &data, !cli.no_latency).await,
-                }
-            } else {
-                // Ensure store is available for non-PubSub operations
-                let store_ref = store_option.as_ref().expect("KvStore should be initialized for non-PubSub benchmarks");
-                let current_data = if *op_type_str_ref == "WRITE" { &data } else { &PreGeneratedData { keys: Arc::clone(&data.keys), values: None } };
-                run_benchmark(&db_name, op_type_str_ref, store_ref.clone(), &cli, current_data, actual_track_latency).await
-            };
-            
-            match result {
-                // FIX 7: Updated results_table push to include total_ops_completed
-                Ok(res) => { results_table.push(( db_name.clone(), *op_type_str_ref, res.ops_per_second, res.total_time.as_secs_f64(), res.avg_latency_ms, res.p99_latency_ms, res.errors, res.total_ops_completed, res.total_bytes_written, res.total_bytes_read )); },
-                Err(e) => { eprintln!("Error benchmarking {} {}: {}", db_name, op_type_str_ref, e); }
+        let op_for_data_gen = if benchmarks_to_run.contains(&"PUBSUB") {
+            match cli.db {
+                DbChoice::InMemory | DbChoice::RustDb => "PUBSUB_INTERNAL",
+                _ => "PUBSUB", // For Redis/Valkey, publishers still "write" data
             }
-        }
-        
-        let summary_workload = if cli.pubsub_only { "Pub/Sub".to_string() } else { format!("{:?}", cli.workload) };
-        println!("\n--- Benchmark Summary (DB: {}, Format: {:?}{}, Workload: {}) ---", db_name, cli.format, if cli.compress_zstd { "+zstd" } else { "" }, summary_workload);
-        let show_latency_in_table = track_latency_globally && !cli.pipeline;
-        let op_col_width = 24;
-        if show_latency_in_table {
-            println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
-            println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<14}|{:-<14}|{:-<10}", "-", "-", "-", "-", "-", "-", "-", "-");
-        } else {
-            println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Errors");
-            println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<10}", "-", "-", "-", "-", "-", "-");
-        }
+        } else { "WRITE" };
+        let data = PreGeneratedData::new(&cli, op_for_data_gen);
 
-        // FIX 7: Updated results_table iteration to include total_ops_completed (though it's not displayed directly in the final table yet)
-        for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, _total_ops_completed, bytes_written, bytes_read) in results_table.iter() {
-            let op_name = if *op == "READ" {
-                let zc_suffix = match cli.format {
-                    DataFormat::Rkyv | DataFormat::Flatbuffers => " (Zero-Copy)",
-                    _ => "",
-                };
-                format!("READ ({:?}){}", cli.workload, zc_suffix)
-            } else if *op == "PUBSUB" {
-                let suffix = match db_choice {
-                    DbChoice::InMemory | DbChoice::RustDb => " (Internal)".to_string(),
-                    _ => "".to_string(),
-                };
-                format!("PUBSUB ({} Pubs){}", cli.num_publishers, suffix)
+        let db_choices = vec![cli.db]; // Only run for the chosen DB
+
+        for db_choice in db_choices {
+            let db_name = format!("{:?}", db_choice);
+
+            let store_option: Option<Box<dyn KvStore + Send + Sync>> = if !benchmarks_to_run.contains(&"PUBSUB") || (db_choice == DbChoice::Redis || db_choice == DbChoice::Valkey) {
+                // For non-PubSub benchmarks, or Redis/Valkey PubSub (which uses the KvStore trait)
+                Some(match db_choice {
+                    DbChoice::Redis => Box::new(RedisStore::new(&cli.redis_url).await?),
+                    DbChoice::Valkey => Box::new(RedisStore::new(&cli.valkey_url).await?),
+                    DbChoice::InMemory => Box::new(InMemoryStore::new()),
+                    DbChoice::RustDb => Box::new(RedisStore::new(&cli.rustdb_url).await?), // Assuming RustDb implements Redis-like behavior and can be used as RedisStore
+                })
             } else {
-                format!("WRITE ({:?})", cli.workload)
+                // For InMemory/RustDb PubSub, the specific internal_pubsub_benchmark is called,
+                // which does not use the KvStore trait directly. So, we don't need to create a KvStore instance here.
+                None
             };
 
-            let total_traffic_bytes = *bytes_written + *bytes_read;
-            let traffic_speed_mb_s = if *time_s > 0.0 { (total_traffic_bytes as f64 / *time_s) / 1_000_000.0 } else { 0.0 };
-            let total_traffic_str = Byte::from(total_traffic_bytes).get_appropriate_unit(UnitType::Binary).to_string();
+            if benchmarks_to_run.contains(&"READ") && store_option.is_some() {
+                let mut prepop_cli = cli.clone();
+                prepop_cli.pipeline = true;
+                prepop_cli.batch_size = cli.batch_size.max(200); // Larger batch for prepopulation
+                println!("\nINFO: Pre-populating {} for READ benchmark...", db_name);
+                run_benchmark(&format!("{}-PrePop", db_name), "WRITE", store_option.as_ref().unwrap().clone(), &prepop_cli, &data, false).await?;
+            }
 
+            let mut results_table = Vec::new();
+            for op_type_str_ref in &benchmarks_to_run {
+                let actual_track_latency = !cli.no_latency && !cli.pipeline;
+
+                let result = if *op_type_str_ref == "PUBSUB" {
+                    match db_choice {
+                        DbChoice::Redis => run_pubsub_benchmark(&db_name, &cli.redis_url, &cli, &data, !cli.no_latency).await,
+                        DbChoice::Valkey => run_pubsub_benchmark(&db_name, &cli.valkey_url, &cli, &data, !cli.no_latency).await,
+                        DbChoice::InMemory | DbChoice::RustDb => run_internal_pubsub_benchmark(&db_name, &cli, &data, !cli.no_latency).await,
+                    }
+                } else {
+                    let store_ref = store_option.as_ref().expect("KvStore should be initialized for non-PubSub benchmarks");
+                    // For READ, we don't need the values in `data` to be present in the `PreGeneratedData` values field,
+                    // as they are only used for generating the *write* payloads. For read, we only need keys.
+                    let current_data = if *op_type_str_ref == "WRITE" { &data } else { &PreGeneratedData { keys: Arc::clone(&data.keys), values: None } };
+                    run_benchmark(&db_name, op_type_str_ref, store_ref.clone(), &cli, current_data, actual_track_latency).await
+                };
+
+                match result {
+                    Ok(res) => { results_table.push(( db_name.clone(), *op_type_str_ref, res.ops_per_second, res.total_time.as_secs_f64(), res.avg_latency_ms, res.p99_latency_ms, res.errors, res.total_ops_completed, res.total_bytes_written, res.total_bytes_read )); },
+                    Err(e) => { eprintln!("Error benchmarking {} {}: {}", db_name, op_type_str_ref, e); }
+                }
+            }
+
+            let summary_workload = if cli.pubsub_only { "Pub/Sub".to_string() } else { format!("{:?}", cli.workload) };
+            println!("\n--- Benchmark Summary (DB: {}, Format: {:?}{}, Workload: {}) ---", db_name, cli.format, if cli.compress_zstd { "+zstd" } else { "" }, summary_workload);
+            let show_latency_in_table = !cli.no_latency && !cli.pipeline;
+            let op_col_width = 24;
             if show_latency_in_table {
-                println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, ops_sec, traffic_speed_mb_s, total_traffic_str, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
+                println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
+                println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<14}|{:-<14}|{:-<10}", "-", "-", "-", "-", "-", "-", "-", "-");
             } else {
-                println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<8}", db, op_name, ops_sec, traffic_speed_mb_s, total_traffic_str, errors);
+                println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<8}", "Database", "Op Type", "Ops/sec", "Speed (MB/s)", "Total Traffic", "Errors");
+                println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<10}", "-", "-", "-", "-", "-", "-");
+            }
+
+            for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, _total_ops_completed, bytes_written, bytes_read) in results_table.iter() {
+                let op_name = if *op == "READ" {
+                    let zc_suffix = match cli.format {
+                        DataFormat::Rkyv | DataFormat::Flatbuffers => " (Zero-Copy)",
+                        _ => "",
+                    };
+                    format!("READ ({:?}){}", cli.workload, zc_suffix)
+                } else if *op == "PUBSUB" {
+                    let suffix = match db_choice {
+                        DbChoice::InMemory | DbChoice::RustDb => " (Internal)".to_string(),
+                        _ => "".to_string(),
+                    };
+                    format!("PUBSUB ({} Pubs){}", cli.num_publishers, suffix)
+                } else {
+                    format!("WRITE ({:?})", cli.workload)
+                };
+
+                let total_traffic_bytes = *bytes_written + *bytes_read;
+                let traffic_speed_mb_s = if *time_s > 0.0 { (total_traffic_bytes as f64 / *time_s) / 1_000_000.0 } else { 0.0 };
+                let total_traffic_str = Byte::from(total_traffic_bytes).get_appropriate_unit(UnitType::Binary).to_string();
+
+                if show_latency_in_table {
+                    println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, ops_sec, traffic_speed_mb_s, total_traffic_str, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
+                } else {
+                    println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<8}", db, op_name, ops_sec, traffic_speed_mb_s, total_traffic_str, errors);
+                }
             }
         }
     }

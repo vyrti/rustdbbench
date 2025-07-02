@@ -26,6 +26,9 @@ async-trait = "0.1.80"
 rustc-hash = "1.1.0"
 dashmap = "6.1.0"
 bytes = "1.6.0"
+axum = { version = "0.8.4", features = ["ws"] }
+tokio-tungstenite = "0.27"
+uuid = { version = "1.0", features = ["v4"] }
 
 [profile.maxperf]
 inherits = "release"

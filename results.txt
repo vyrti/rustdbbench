@@ -1,26 +1,15 @@
-kv_benchmark --format bitcode -n 100000 -c 100 --value-size 10000 --pipeline
---- Benchmark Summary (Format: Bitcode) ---
-Database        | Op Type  | Ops/sec         | Total Time(s) | Errors  
-----------------|----------|-----------------|--------------|----------
-Redis           | WRITE    | 70777.70        | 1.413        | 0       
-Redis           | READ     | 145138.62       | 0.689        | 0       
-Valkey          | WRITE    | 75242.10        | 1.329        | 0       
-Valkey          | READ     | 140158.16       | 0.713        | 0       
+./kv_benchmark/target/maxperf/kv_benchmark --db in-memory --num-publishers 1000000 -c 1500000 -o 1000000 --format rkyv --pubsub-only --read-size 1
+Configuration: DB=InMemory, Workload=Chat, Ops=1000000, Concurrency=1500000, Format=Rkyv, ValueBaseSize=128B
+Pub/Sub mode: Publishers=1000000
+Chat Sim: Chats=1000, HistoryLen=100, ReadSize=1
+Technical: Pipeline=false, BatchSize=50, NoLatency=false, Compression=none
+Pre-generating 1000 keys and potentially 1000000 message values (base size 128B)...
+Pre-generated 1000000 values. Average serialized value size: 152.00 B.
+Data generation complete.
 
-kv_benchmark --format json -n 100000 -c 100 --value-size 10000 --pipeline
---- Benchmark Summary (Format: Json) ---
-Database        | Op Type  | Ops/sec         | Total Time(s) | Errors  
-----------------|----------|-----------------|--------------|----------
-Redis           | WRITE    | 34049.54        | 2.937        | 0       
-Redis           | READ     | 90777.11        | 1.102        | 0       
-Valkey          | WRITE    | 37146.46        | 2.692        | 0       
-Valkey          | READ     | 107253.44       | 0.932        | 0
-
-kv_benchmark --format protobuf --zero-copy-read --value-size 10000 -n 100000 -c 100 --pipeline
---- Benchmark Summary (Format: Protobuf zero-copy read) ---
-Database        | Op Type     | Ops/sec         | Total Time(s) | Errors  
-----------------|-------------|-----------------|--------------|----------
-Redis           | WRITE       | 73817.73        | 1.355        | 0       
-Redis           | READ (Raw)  | 132707.57       | 0.754        | 0       
-Valkey          | WRITE       | 86961.77        | 1.150        | 0       
-Valkey          | READ (Raw)  | 136438.13       | 0.733        | 0
+Benchmarking InMemory ZERO-COPY INTERNAL BROADCAST PUBSUB (1000000 pubs, 500000 subs, 1000000 ops total)...
+  [00:01:44] [########################################] 1000000/1000000 (0s) Done                                                 
+--- Benchmark Summary (DB: InMemory, Format: Rkyv, Workload: Pub/Sub) ---
+Database     | Op Type                  | Ops/sec        | Speed (MB/s)   | Total Traffic  | Avg Lat(ms)  | P99 Lat(ms)  | Errors  
+-------------|------------------------|----------------|----------------|----------------|--------------|--------------|----------
+InMemory     | PUBSUB (1000000 Pubs) (Internal) | 9658.74        | 119.76         | 11.547223217785358 GiB | 0.000        | 0.000        | 0

@@ -9,7 +9,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpSocket};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -45,6 +45,7 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
     // --- End Multi-IP Logic ---
 
     println!("\nBenchmarking {} WebSocket Chat ({} clients, {} total ops)...", db_name, cli.concurrency, cli.num_ops);
+    println!("Connecting clients...");
 
     let pb = ProgressBar::new(cli.num_ops as u64);
     pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}").unwrap().progress_chars("#>-"));
@@ -68,6 +69,7 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let all_publishers_done = Arc::new(tokio::sync::Barrier::new(cli.concurrency + 1));
+    let all_clients_ready = Arc::new(tokio::sync::Barrier::new(cli.concurrency));
 
 
     for worker_id in 0..cli.concurrency {
@@ -83,6 +85,7 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
         let cli_clone = cli.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let all_publishers_done_clone = all_publishers_done.clone();
+        let all_clients_ready_clone = all_clients_ready.clone();
         
         client_tasks.push(tokio::spawn(async move {
             let mut hist = if track_latency_clone { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
@@ -109,12 +112,17 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
                     eprintln!("Client worker {}: Failed to establish WS connection: {}", worker_id, e);
                     total_errors_clone.fetch_add(ops_per_client, Ordering::Relaxed);
                     progress_bar_clone.inc(ops_per_client as u64);
+                    // Still wait on the barrier to not hang other clients if one fails.
+                    all_clients_ready_clone.wait().await;
                     return WorkerResult {
                         histogram: None, errors: ops_per_client, ops_done: 0, bytes_written: 0, bytes_read: 0, active_ws_connections: None
                     };
                 }
             };
             
+            // Wait for all other clients to connect before starting work.
+            all_clients_ready_clone.wait().await;
+
             // --- Listener Task ---
             let listener_task = tokio::spawn(async move {
                 let mut local_received_ops = 0;
@@ -155,7 +163,6 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
                 
                 let serialized_bytes = to_bytes::<RkyvError>(&payload_struct).unwrap();
                 let msg_len = serialized_bytes.len();
-                // Corrected: Add .into() to convert Vec<u8> to bytes::Bytes
                 let message = Message::Binary(serialized_bytes.into_vec().into());
                 
                 let op_start_time = if track_latency_clone { Some(Instant::now()) } else { None };
@@ -184,7 +191,7 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
 
             WorkerResult {
                 histogram: hist,
-                errors: local_errors,
+                errors: local_errors + listener_errors,
                 ops_done: local_published_ops,
                 bytes_written: 0, // Handled by atomic
                 bytes_read: 0, // Handled by atomic
@@ -193,12 +200,17 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
         }));
     }
 
+    println!("All clients connected. Starting benchmark.");
     let start_time = Instant::now();
     
     // Wait for all publisher loops to finish
     all_publishers_done.wait().await;
     
     let total_time = start_time.elapsed();
+
+    // Add a delay to allow listeners to process in-flight messages before shutdown.
+    println!("Publishing complete. Waiting for message propagation... (5s)");
+    tokio::time::sleep(Duration::from_secs(5)).await;
     
     // Signal all listener tasks to shut down
     let _ = shutdown_tx.send(());

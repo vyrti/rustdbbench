@@ -15,7 +15,7 @@ use tokio::sync::{mpsc}; // Removed `broadcast` as InternalPubSub manages it
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 use bytes::Bytes;
-use rkyv::{Archive, access, Archived, rancor::Error as RkyvError}; // Corrected: use access, Archived, RkyvError
+use rkyv::{access, Archived, rancor::Error as RkyvError};
 use crate::benchmark::pubsub::InternalPubSub;
 use crate::benchmark::data::BenchmarkPayload;
 use crate::cli::DataFormat; // Keep DataFormat, it's used in AppState.

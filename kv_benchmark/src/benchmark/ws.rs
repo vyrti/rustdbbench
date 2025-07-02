@@ -16,7 +16,6 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{client_async, MaybeTlsStream, WebSocketStream}; // Removed WebSocketStream as it's re-exported
 use rand::{prelude::*, rngs::StdRng};
 use rkyv::{rancor::Error as RkyvError, to_bytes, access, Archived}; // Corrected: Use access, Archived
-use bytes::Bytes;
 
 pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
     if cli.num_ops == 0 {

@@ -1,7 +1,8 @@
+// kv_benchmark/src/ws_server.rs
 use anyhow::Result;
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade}, // Kept WebSocketUpgrade for `axum_websocket_upgrade_handler`
+        ws::{Message, WebSocket, WebSocketUpgrade}, // Kept WebSocketUpgrade as it's used in the handler signature
         State,
     },
     response::IntoResponse,
@@ -11,11 +12,11 @@ use axum::{
 use dashmap::DashMap;
 use futures::{sink::SinkExt, stream::StreamExt};
 use std::sync::Arc;
-use tokio::sync::{mpsc}; // Removed `broadcast` as InternalPubSub manages it
+use tokio::sync::{mpsc};
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 use bytes::Bytes;
-use rkyv::{access, Archived, rancor::Error as RkyvError};
+use rkyv::{access, Archived, rancor::Error as RkyvError}; // Removed Archive, as only access is needed
 use crate::benchmark::pubsub::InternalPubSub;
 use crate::benchmark::data::BenchmarkPayload;
 use crate::cli::DataFormat; // Keep DataFormat, it's used in AppState.
@@ -86,7 +87,6 @@ async fn handle_websocket_connection(socket: WebSocket, app_state: Arc<WsAppStat
                     eprintln!("Client {} sent unexpected text: {}", client_id, t);
                 }
                 Message::Binary(b) => {
-                    // Corrected: Use rkyv::access for zero-copy deserialization
                     let payload_ref = access::<Archived<BenchmarkPayload>, RkyvError>(&b)
                                         .map(|archived| archived)
                                         .ok();

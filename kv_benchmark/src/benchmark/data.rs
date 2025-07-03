@@ -80,6 +80,7 @@ pub struct BenchResult {
     pub total_ops_completed: usize,
     pub total_bytes_written: u64,
     pub total_bytes_read: u64,
+    pub total_lagged_messages: usize,
 }
 
 pub struct WorkerResult {
@@ -89,6 +90,7 @@ pub struct WorkerResult {
     pub bytes_written: u64,
     pub bytes_read: u64,
     pub active_ws_connections: Option<Vec<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    pub lagged_messages: usize,
 }
 
 pub fn generate_random_string(len: usize, rng: &mut impl Rng) -> String {

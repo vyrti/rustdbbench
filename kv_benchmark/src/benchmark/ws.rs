@@ -115,7 +115,7 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
                     // Still wait on the barrier to not hang other clients if one fails.
                     all_clients_ready_clone.wait().await;
                     return WorkerResult {
-                        histogram: None, errors: ops_per_client, ops_done: 0, bytes_written: 0, bytes_read: 0, active_ws_connections: None
+                        histogram: None, errors: ops_per_client, ops_done: 0, bytes_written: 0, bytes_read: 0, active_ws_connections: None, lagged_messages: 0
                     };
                 }
             };
@@ -195,7 +195,8 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
                 ops_done: local_published_ops,
                 bytes_written: 0, // Handled by atomic
                 bytes_read: 0, // Handled by atomic
-                active_ws_connections: None
+                active_ws_connections: None,
+                lagged_messages: 0,
             }
         }));
     }
@@ -264,5 +265,6 @@ pub async fn run_ws_benchmark(db_name: &str, ws_url: &str, cli: &Cli, _data: &Pr
         total_ops_completed: final_published_ops,
         total_bytes_written: final_bytes_written,
         total_bytes_read: final_bytes_read,
+        total_lagged_messages: 0,
     })
 }

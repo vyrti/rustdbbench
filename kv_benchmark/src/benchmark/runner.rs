@@ -92,7 +92,7 @@ pub async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore
                     progress_bar_clone.inc(1);
                 }
             }
-            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: local_bytes_read, active_ws_connections: None }
+            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: local_bytes_read, active_ws_connections: None, lagged_messages: 0 }
         }));
     }
     let worker_results = futures::future::join_all(tasks).await;
@@ -113,14 +113,13 @@ pub async fn run_benchmark(db_name: &str, op_type_ref: &str, db: Box<dyn KvStore
         } else {
             eprintln!("Worker task panicked.");
             total_errors += ops_per_worker;
-            total_ops_completed += ops_per_worker;
         }
     }
     if total_errors > 0 { println!("WARNING: {}/{} operations reported errors.", total_errors, cli.num_ops); }
     let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
-    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read })
+    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read, total_lagged_messages: 0 })
 }
 
 pub fn process_read_result_chat(messages: Vec<Vec<u8>>, format: DataFormat, compressed: bool) -> bool {

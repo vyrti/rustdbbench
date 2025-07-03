@@ -1,20 +1,15 @@
-use crate::benchmark::data::{generate_random_string, BenchResult, BenchmarkPayload, PreGeneratedData, WorkerResult};
+use crate::benchmark::data::{BenchResult, PreGeneratedData, WorkerResult};
 use crate::benchmark::runner::process_read_result_simple;
-use crate::cli::{Cli, DataFormat};
-use crate::{fbs, pb};
 use anyhow::Result;
-use bitcode;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::stream::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle}; // Corrected: Added ProgressBar, ProgressStyle
-use prost::Message as ProtobufMessage;
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::{prelude::*, rngs::StdRng};
 use redis::AsyncCommands;
-use rkyv::{rancor::Error as RkyvError, to_bytes};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering}; // Corrected: Added AtomicU64
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -56,7 +51,7 @@ impl InternalPubSub {
     }
 }
 
-pub async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
+pub async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &crate::cli::Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
     let num_publishers = cli.num_publishers;
     let num_subscribers = cli.concurrency.saturating_sub(num_publishers);
     if num_subscribers == 0 { return Err(anyhow::anyhow!("Pub/Sub benchmark requires at least one subscriber.")); }
@@ -126,7 +121,7 @@ pub async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, 
                 if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) { h.record(st.elapsed().as_micros() as u64).unwrap(); }
             }
             progress_bar_clone.inc((worker_end_idx - worker_start_idx) as u64);
-            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: 0, active_ws_connections: None }
+            WorkerResult { histogram: hist, errors: local_errors, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: 0, active_ws_connections: None, lagged_messages: 0 }
         }));
     }
     let publisher_results = futures::future::join_all(pub_tasks).await;
@@ -147,7 +142,6 @@ pub async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, 
         } else {
             eprintln!("Publisher worker task panicked.");
             total_errors += ops_per_publisher;
-            total_ops_completed += ops_per_publisher;
         }
     }
     let total_bytes_read_raw = received_bytes_count.load(Ordering::SeqCst);
@@ -155,70 +149,66 @@ pub async fn run_pubsub_benchmark(db_name: &str, db_url_slice: &str, cli: &Cli, 
     let successful_ops = total_ops_completed.saturating_sub(total_errors);
     let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
-    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read: total_bytes_read_raw })
+    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read: total_bytes_read_raw, total_lagged_messages: 0 })
 }
 
-pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
+pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &crate::cli::Cli, data: &PreGeneratedData, track_latency: bool) -> Result<BenchResult> {
     let num_publishers = cli.num_publishers;
     let num_subscribers = cli.concurrency.saturating_sub(num_publishers);
     if num_subscribers == 0 { return Err(anyhow::anyhow!("Pub/Sub benchmark requires at least one subscriber.")); }
     if num_publishers == 0 { return Err(anyhow::anyhow!("Pub/Sub benchmark requires at least one publisher.")); }
     println!("\nBenchmarking {} ZERO-COPY INTERNAL BROADCAST PUBSUB ({} pubs, {} subs, {} ops total)...", db_name, num_publishers, num_subscribers, cli.num_ops);
 
-    let internal_pubsub = InternalPubSub::new(256); // Use a default channel size for the benchmark
+    let internal_pubsub = InternalPubSub::new(1024); // Increased channel size for high throughput
     let pb = ProgressBar::new(cli.num_ops as u64);
     pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}").unwrap().progress_chars("#>-"));
     pb.set_message(format!("{} Zero-Copy PUBSUB", db_name));
     let pb_arc = Arc::new(pb);
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    // Atomics for tracking subscriber results
     let received_msg_count = Arc::new(AtomicUsize::new(0));
     let received_bytes_count = Arc::new(AtomicU64::new(0));
+    let lagged_msg_count = Arc::new(AtomicUsize::new(0)); // For tracking lagged messages
+
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let ready_barrier = Arc::new(tokio::sync::Barrier::new(num_subscribers + num_publishers));
     let mut sub_tasks = Vec::with_capacity(num_subscribers);
 
+    const SINGLE_TOPIC: &str = "benchmark_broadcast_channel";
+
     for _ in 0..num_subscribers {
         let internal_pubsub_clone = internal_pubsub.clone();
-        let keys_ref = Arc::clone(&data.keys);
         let msg_count = received_msg_count.clone();
         let bytes_count = received_bytes_count.clone();
+        let lag_count = lagged_msg_count.clone();
         let barrier = ready_barrier.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let cli_format = cli.format;
         let cli_compress_zstd = cli.compress_zstd;
 
         sub_tasks.push(tokio::spawn(async move {
-            let mut receivers: Vec<broadcast::Receiver<Arc<Bytes>>> = Vec::new();
-            for key in keys_ref.iter() {
-                receivers.push(internal_pubsub_clone.subscribe(key.clone()));
-            }
+            // REFACTORED: Subscribe to one topic only.
+            let mut receiver = internal_pubsub_clone.subscribe(SINGLE_TOPIC.to_string());
             barrier.wait().await;
-            let mut current_receiver_idx = 0;
+
+            // REFACTORED: Simplified receive loop.
             loop {
                 tokio::select! {
                     biased;
                     _ = shutdown_rx.recv() => break,
-                    recv_res = async {
-                        if receivers.is_empty() { futures::future::pending::<Result<Arc<Bytes>, RecvError>>().await }
-                        else {
-                            if current_receiver_idx >= receivers.len() { current_receiver_idx = 0; }
-                            let res = receivers[current_receiver_idx].recv().await;
-                            if !receivers.is_empty() && matches!(res, Err(RecvError::Closed)) {
-                                receivers.remove(current_receiver_idx);
-                                if current_receiver_idx >= receivers.len() && !receivers.is_empty() { current_receiver_idx = 0; }
-                            } else if !receivers.is_empty() {
-                                current_receiver_idx = (current_receiver_idx + 1) % receivers.len();
-                            }
-                            res
-                        }
-                    } => {
+                    recv_res = receiver.recv() => {
                         match recv_res {
                             Ok(msg_arc) => {
                                 msg_count.fetch_add(1, Ordering::Relaxed);
                                 bytes_count.fetch_add(msg_arc.len() as u64, Ordering::Relaxed);
+                                // We can still process the read to simulate workload, but it's optional.
                                 let _ = process_read_result_simple(&msg_arc, cli_format, cli_compress_zstd);
                             },
-                            Err(RecvError::Lagged(_)) => {},
-                            Err(RecvError::Closed) => if receivers.is_empty() { break; }
+                            Err(RecvError::Lagged(n)) => {
+                                // This is a critical metric. It means this subscriber is too slow.
+                                lag_count.fetch_add(n as usize, Ordering::Relaxed);
+                            },
+                            Err(RecvError::Closed) => break,
                         }
                     },
                 }
@@ -230,59 +220,50 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
     let ops_per_publisher = (cli.num_ops + num_publishers - 1) / num_publishers;
     for worker_id in 0..num_publishers {
         let internal_pubsub_clone = internal_pubsub.clone();
-        let keys_ref = Arc::clone(&data.keys);
-        let cli_clone = cli.clone();
+        // REFACTORED: Use pre-generated values for fair comparison.
+        let values_ref = data.values.as_ref().expect("Values must be pre-generated for Pub/Sub benchmark").clone();
         let progress_bar_clone = pb_arc.clone();
         let barrier = ready_barrier.clone();
         let worker_start_idx = worker_id * ops_per_publisher;
         let worker_end_idx = ((worker_id + 1) * ops_per_publisher).min(cli.num_ops);
         if worker_start_idx >= worker_end_idx { continue; }
+
         pub_tasks.push(tokio::spawn(async move {
             let mut hist = if track_latency { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
             let mut local_ops_done = 0;
             let mut local_bytes_written = 0;
-            let mut rng = StdRng::from_entropy();
+
             barrier.wait().await;
+
             for i in worker_start_idx..worker_end_idx {
-                let key = &keys_ref[rng.gen_range(0..keys_ref.len())];
-                let random_data = generate_random_string(cli_clone.value_size, &mut rng);
-                let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                let serialized_bytes = match cli_clone.format {
-                    DataFormat::String => random_data.into_bytes(),
-                    DataFormat::Json => serde_json::to_vec(&BenchmarkPayload { data: random_data, timestamp, id: i }).unwrap(),
-                    DataFormat::Bitcode => bitcode::serialize(&BenchmarkPayload { data: random_data, timestamp, id: i }).unwrap(),
-                    DataFormat::Protobuf => pb::BenchmarkPayload { data: random_data, timestamp, id: i as u64 }.encode_to_vec(),
-                    DataFormat::Rkyv => to_bytes::<RkyvError>(&BenchmarkPayload { data: random_data, timestamp, id: i }).unwrap().into_vec(),
-                    DataFormat::Flatbuffers => {
-                        let mut builder = flatbuffers::FlatBufferBuilder::new();
-                        let data_offset = builder.create_string(&random_data);
-                        let mut payload_builder = fbs::benchmark_fbs::BenchmarkPayloadBuilder::new(&mut builder);
-                        payload_builder.add_data(data_offset);
-                        payload_builder.add_timestamp(timestamp);
-                        payload_builder.add_id(i as u64);
-                        let payload_offset = payload_builder.finish();
-                        builder.finish(payload_offset, None);
-                        builder.finished_data().to_vec()
-                    }
-                };
-                let value_bytes: Arc<Bytes> = Arc::new(Bytes::from(serialized_bytes));
+                let value_vec = &values_ref[i];
+                // Create the zero-copy Arc<Bytes> from the pre-serialized Vec<u8>
+                let value_bytes: Arc<Bytes> = Arc::new(Bytes::from(value_vec.clone()));
+
                 let op_start_time = if track_latency { Some(Instant::now()) } else { None };
-                internal_pubsub_clone.publish(key.clone(), value_bytes.clone()); // Use the new publish method
-                local_ops_done += 1; // Assume publish is "successful" if it doesn't panic
+
+                // Publish to the single, shared topic
+                internal_pubsub_clone.publish(SINGLE_TOPIC.to_string(), value_bytes.clone());
+
+                local_ops_done += 1;
                 local_bytes_written += value_bytes.len() as u64;
                 if let (Some(st), Some(h)) = (op_start_time, hist.as_mut()) { h.record(st.elapsed().as_micros() as u64).unwrap(); }
             }
             progress_bar_clone.inc((worker_end_idx - worker_start_idx) as u64);
-            WorkerResult { histogram: hist, errors: 0, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: 0, active_ws_connections: None }
+            // Lagged messages are tracked by subscribers, so publisher result is 0.
+            WorkerResult { histogram: hist, errors: 0, ops_done: local_ops_done, bytes_written: local_bytes_written, bytes_read: 0, active_ws_connections: None, lagged_messages: 0 }
         }));
     }
-    let start_time = Instant::now();
+
+    let start_time = Instant::now(); // Start timing after barrier is passed by publishers
     let publisher_results = futures::future::join_all(pub_tasks).await;
-    let total_time = start_time.elapsed();
-    // internal_pubsub.clear(); // No longer needed, as InternalPubSub manages its own state lifecycle
+    let total_time_publishing = start_time.elapsed();
+
+    // Now that publishing is done, signal subscribers to shut down.
     let _ = shutdown_tx.send(());
     pb_arc.finish_with_message("Done");
     let _ = futures::future::join_all(sub_tasks).await;
+
     let mut final_histogram = if track_latency { Some(hdrhistogram::Histogram::<u64>::new(3).unwrap()) } else { None };
     let mut total_errors = 0;
     let mut total_ops_completed = 0;
@@ -296,13 +277,24 @@ pub async fn run_internal_pubsub_benchmark(db_name: &str, cli: &Cli, data: &PreG
         } else {
             eprintln!("Publisher worker task panicked.");
             total_errors += ops_per_publisher;
-            total_ops_completed += ops_per_publisher;
         }
     }
     let total_bytes_read_raw = received_bytes_count.load(Ordering::SeqCst);
+    let total_lagged_messages = lagged_msg_count.load(Ordering::SeqCst);
 
     let successful_ops = total_ops_completed.saturating_sub(total_errors);
-    let ops_per_second = if total_time.as_secs_f64() > 0.0 { successful_ops as f64 / total_time.as_secs_f64() } else { 0.0 };
+    let ops_per_second = if total_time_publishing.as_secs_f64() > 0.0 { successful_ops as f64 / total_time_publishing.as_secs_f64() } else { 0.0 };
     let (avg_lat, p99_lat) = if let Some(hist) = final_histogram.as_ref() { (Some(hist.mean() / 1000.0), Some(hist.value_at_percentile(99.0) as f64 / 1000.0)) } else { (None, None) };
-    Ok(BenchResult { ops_per_second, total_time, avg_latency_ms: avg_lat, p99_latency_ms: p99_lat, errors: total_errors, total_ops_completed, total_bytes_written, total_bytes_read: total_bytes_read_raw })
+
+    Ok(BenchResult {
+        ops_per_second,
+        total_time: total_time_publishing,
+        avg_latency_ms: avg_lat,
+        p99_latency_ms: p99_lat,
+        errors: total_errors,
+        total_ops_completed,
+        total_bytes_written,
+        total_bytes_read: total_bytes_read_raw,
+        total_lagged_messages,
+    })
 }

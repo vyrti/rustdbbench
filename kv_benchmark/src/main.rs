@@ -82,10 +82,8 @@ async fn main() -> Result<()> {
         let op_for_data_gen = if benchmarks_to_run.contains(&"WS_CHAT_EMULATION") {
             "WRITE" // Need messages to send, so treat as a write operation
         } else if benchmarks_to_run.contains(&"PUBSUB") {
-            match cli.db {
-                DbChoice::InMemory | DbChoice::RustDb => "PUBSUB_INTERNAL",
-                _ => "PUBSUB",
-            }
+            // For both Redis and Internal PubSub, we need to pre-generate message values.
+            "PUBSUB"
         } else {
             "WRITE"
         };
@@ -140,7 +138,7 @@ async fn main() -> Result<()> {
                 };
 
                 match result {
-                    Ok(res) => { results_table.push(( db_name.clone(), *op_type_str_ref, res.ops_per_second, res.total_time.as_secs_f64(), res.avg_latency_ms, res.p99_latency_ms, res.errors, res.total_ops_completed, res.total_bytes_written, res.total_bytes_read )); },
+                    Ok(res) => { results_table.push(( db_name.clone(), *op_type_str_ref, res.ops_per_second, res.total_time.as_secs_f64(), res.avg_latency_ms, res.p99_latency_ms, res.errors, res.total_ops_completed, res.total_bytes_written, res.total_bytes_read, res.total_lagged_messages )); },
                     Err(e) => { eprintln!("Error benchmarking {} {}: {}", db_name, op_type_str_ref, e); }
                 }
             }
@@ -152,7 +150,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-type ResultsData<'a> = &'a [(String, &'a str, f64, f64, Option<f64>, Option<f64>, usize, usize, u64, u64)];
+type ResultsData<'a> = &'a [(String, &'a str, f64, f64, Option<f64>, Option<f64>, usize, usize, u64, u64, usize)];
 
 fn print_summary_table(db_name: &str, cli: &Cli, results_table: ResultsData, db_choice: DbChoice) {
     let summary_workload = match db_choice {
@@ -163,16 +161,28 @@ fn print_summary_table(db_name: &str, cli: &Cli, results_table: ResultsData, db_
     };
     println!("\n--- Benchmark Summary (DB: {}, Format: {:?}{}, Workload: {}) ---", db_name, cli.format, if cli.compress_zstd { "+zstd" } else { "" }, summary_workload);
     let show_latency_in_table = !cli.no_latency && !cli.pipeline;
+    let is_pubsub = results_table.iter().any(|r| r.1 == "PUBSUB");
     let op_col_width = 24;
+
+    // --- Print Header ---
     if show_latency_in_table {
-        println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Rate/Sec", "Speed (MB/s)", "Total Traffic", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
-        println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<14}|{:-<14}|{:-<10}", "-", "-", "-", "-", "-", "-", "-", "-");
+        print!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<12} | {:<12} | {:<8}", "Database", "Op Type", "Rate/Sec", "Speed (MB/s)", "Total Traffic", "Avg Lat(ms)", "P99 Lat(ms)", "Errors");
+        if is_pubsub { print!(" | {:<12}", "Lagged Msgs"); }
+        println!();
+        print!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<14}|{:-<14}|{:-<10}", "-", "-", "-", "-", "-", "-", "-", "-");
+        if is_pubsub { print!("|{:-<14}", "-"); }
+        println!();
     } else {
-        println!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<8}", "Database", "Op Type", "Rate/Sec", "Speed (MB/s)", "Total Traffic", "Errors");
-        println!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<10}", "-", "-", "-", "-", "-", "-");
+        print!("{:<12} | {:<op_col_width$} | {:<14} | {:<14} | {:<14} | {:<8}", "Database", "Op Type", "Rate/Sec", "Speed (MB/s)", "Total Traffic", "Errors");
+        if is_pubsub { print!(" | {:<12}", "Lagged Msgs"); }
+        println!();
+        print!("{:-<13}|{:-<op_col_width$}|{:-<16}|{:-<16}|{:-<16}|{:-<10}", "-", "-", "-", "-", "-", "-");
+        if is_pubsub { print!("|{:-<14}", "-"); }
+        println!();
     }
 
-    for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, total_ops_completed, bytes_written, bytes_read) in results_table.iter() {
+    // --- Print Rows ---
+    for (db, op, ops_sec, time_s, avg_lat, p99_lat, errors, total_ops_completed, bytes_written, bytes_read, lagged_messages) in results_table.iter() {
         let op_name = if *op == "READ" {
             let zc_suffix = match cli.format {
                 cli::DataFormat::Rkyv | cli::DataFormat::Flatbuffers => " (Zero-Copy)",
@@ -184,7 +194,7 @@ fn print_summary_table(db_name: &str, cli: &Cli, results_table: ResultsData, db_
                 DbChoice::InMemory | DbChoice::RustDb => " (Internal)".to_string(),
                 _ => "".to_string(),
             };
-            format!("PUBSUB ({} Pubs){}", cli.num_publishers, suffix)
+            format!("PUBSUB ({}P/{}S){}", cli.num_publishers, cli.concurrency.saturating_sub(cli.num_publishers), suffix)
         } else if *op == "WS_CONNECTIONS" {
             format!("WS Conn ({} Target)", cli.num_ops)
         } else if *op == "WS_CHAT_EMULATION" {
@@ -210,9 +220,13 @@ fn print_summary_table(db_name: &str, cli: &Cli, results_table: ResultsData, db_
 
 
         if show_latency_in_table {
-            println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, primary_rate_val, traffic_speed_mb_s, total_traffic_str, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
+            print!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<12.3} | {:<12.3} | {:<8}", db, op_name, primary_rate_val, traffic_speed_mb_s, total_traffic_str, avg_lat.unwrap_or(0.0), p99_lat.unwrap_or(0.0), errors);
+            if is_pubsub { print!(" | {:<12}", lagged_messages); }
+            println!();
         } else {
-            println!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<8}", db, op_name, primary_rate_val, traffic_speed_mb_s, total_traffic_str, errors);
+            print!("{:<12} | {:<op_col_width$} | {:<14.2} | {:<14.2} | {:<14} | {:<8}", db, op_name, primary_rate_val, traffic_speed_mb_s, total_traffic_str, errors);
+            if is_pubsub { print!(" | {:<12}", lagged_messages); }
+            println!();
         }
     }
 }

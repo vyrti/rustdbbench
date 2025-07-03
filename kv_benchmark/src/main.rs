@@ -1,3 +1,4 @@
+// src/main.rs
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
@@ -21,7 +22,8 @@ use cli::{Cli, DbChoice, Workload};
 use db::{in_memory::InMemoryStore, redis::RedisStore, KvStore};
 use benchmark::{
     data::PreGeneratedData,
-    pubsub::{run_internal_pubsub_benchmark, run_pubsub_benchmark, InternalPubSub}, // Import InternalPubSub
+    nats_pubsub::run_nats_pubsub_benchmark,
+    pubsub::{run_internal_pubsub_benchmark, run_pubsub_benchmark, InternalPubSub},
     runner::run_benchmark,
     ws::run_ws_benchmark,
 };
@@ -32,6 +34,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Check for incompatible flags
+    if cli.db == DbChoice::Nats && (cli.write_only || cli.read_only) {
+        eprintln!("Error: When --db Nats is chosen, only --pubsub-only is applicable.");
+        return Ok(());
+    }
     if cli.db == DbChoice::WebSocket && (cli.write_only || cli.read_only || cli.pubsub_only) {
         eprintln!("Error: When --db WebSocket is chosen, other benchmark flags like --write-only, --read-only, or --pubsub-only are not applicable as it runs a dedicated connection capacity test.");
         return Ok(());
@@ -57,14 +63,15 @@ async fn main() -> Result<()> {
         println!("Technical: Pipeline={}, BatchSize={}, NoLatency={}, Compression={}", cli.pipeline, cli.batch_size, cli.no_latency, if cli.compress_zstd {"zstd"} else {"none"});
 
         if cli.db != DbChoice::InMemory {
-            println!("Ensure Redis ({}), Valkey ({}), RustDb ({}) and WebSocket Server ({}) are running", cli.redis_url, cli.valkey_url, cli.rustdb_url, cli.ws_url);
+            println!("Ensure Redis ({}), Valkey ({}), RustDb ({}), NATS ({}), and WebSocket Server ({}) are running", cli.redis_url, cli.valkey_url, cli.rustdb_url, cli.nats_url, cli.ws_url);
         }
 
         if cli.num_ops == 0 { println!("Number of operations is 0, exiting."); return Ok(()); }
 
         let benchmarks_to_run = match cli.db {
             DbChoice::WebSocket => vec!["WS_CONNECTIONS"],
-            DbChoice::WebSocketChat => vec!["WS_CHAT_EMULATION"], // New benchmark type
+            DbChoice::WebSocketChat => vec!["WS_CHAT_EMULATION"],
+            DbChoice::Nats => vec!["PUBSUB"],
             _ => { // Existing logic for other DB types
                 match (cli.write_only, cli.read_only, cli.pubsub_only) {
                     (true, false, false) => vec!["WRITE"],
@@ -95,7 +102,7 @@ async fn main() -> Result<()> {
         for db_choice in db_choices {
             let db_name = format!("{:?}", db_choice);
 
-            let store_option: Option<Box<dyn KvStore + Send + Sync>> = if db_choice != DbChoice::WebSocket && db_choice != DbChoice::WebSocketChat {
+            let store_option: Option<Box<dyn KvStore + Send + Sync>> = if !matches!(db_choice, DbChoice::WebSocket | DbChoice::WebSocketChat | DbChoice::Nats) {
                 Some(match db_choice {
                     DbChoice::Redis => Box::new(RedisStore::new(&cli.redis_url).await?),
                     DbChoice::Valkey => Box::new(RedisStore::new(&cli.valkey_url).await?),
@@ -127,6 +134,7 @@ async fn main() -> Result<()> {
                             DbChoice::Redis => run_pubsub_benchmark(&db_name, &cli.redis_url, &cli, &data, !cli.no_latency).await,
                             DbChoice::Valkey => run_pubsub_benchmark(&db_name, &cli.valkey_url, &cli, &data, !cli.no_latency).await,
                             DbChoice::InMemory | DbChoice::RustDb => run_internal_pubsub_benchmark(&db_name, &cli, &data, !cli.no_latency).await,
+                            DbChoice::Nats => run_nats_pubsub_benchmark(&db_name, &cli.nats_url, &cli, &data, !cli.no_latency).await,
                             _ => unreachable!(),
                         }
                     },
@@ -190,11 +198,12 @@ fn print_summary_table(db_name: &str, cli: &Cli, results_table: ResultsData, db_
             };
             format!("READ ({:?}){}", cli.workload, zc_suffix)
         } else if *op == "PUBSUB" {
+            let num_subs = cli.concurrency.saturating_sub(cli.num_publishers);
             let suffix = match db_choice {
                 DbChoice::InMemory | DbChoice::RustDb => " (Internal)".to_string(),
                 _ => "".to_string(),
             };
-            format!("PUBSUB ({}P/{}S){}", cli.num_publishers, cli.concurrency.saturating_sub(cli.num_publishers), suffix)
+            format!("PUBSUB ({}P/{}S){}", cli.num_publishers, num_subs, suffix)
         } else if *op == "WS_CONNECTIONS" {
             format!("WS Conn ({} Target)", cli.num_ops)
         } else if *op == "WS_CHAT_EMULATION" {

@@ -14,7 +14,7 @@ pub enum Workload {
 
 #[derive(ValueEnum, Clone, Debug, Copy, PartialEq, Eq)]
 pub enum DbChoice {
-    Redis, Valkey, InMemory, RustDb, WebSocket, WebSocketChat, // Added WebSocketChat
+    Redis, Valkey, InMemory, RustDb, WebSocket, WebSocketChat, Nats,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -28,6 +28,8 @@ pub struct Cli {
     pub valkey_url: String,
     #[clap(long, default_value = "redis://127.0.0.1:7878", help="URL for the custom Rust Redis server.")]
     pub rustdb_url: String,
+    #[clap(long, default_value = "nats://127.0.0.1:4222", help="URL for the NATS server.")]
+    pub nats_url: String,
     #[clap(long, default_value = "ws://127.0.0.1:3000/ws", help="URL for the WebSocket server.")]
     pub ws_url: String,
     #[clap(long, default_value = "127.0.0.2", help = "Base IP address for multi-IP client mode.")]

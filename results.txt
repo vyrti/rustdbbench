@@ -1,18 +1,4 @@
 ./kv_benchmark/target/maxperf/kv_benchmark --db in-memory --num-publishers 1000000 -c 1500000 -o 1000000 --format rkyv --pubsub-only --read-size 1
-Configuration: DB=InMemory, Workload=Chat, Ops=1000000, Concurrency=1500000, Format=Rkyv, ValueBaseSize=128B
-Pub/Sub mode: Publishers=1000000
-Chat Sim: Chats=1000, HistoryLen=100, ReadSize=1
-Technical: Pipeline=false, BatchSize=50, NoLatency=false, Compression=none
-Pre-generating 1000 keys and potentially 1000000 message values (base size 128B)...
-Pre-generated 1000000 values. Average serialized value size: 152.00 B.
-Data generation complete.
-
-Benchmarking InMemory ZERO-COPY INTERNAL BROADCAST PUBSUB (1000000 pubs, 500000 subs, 1000000 ops total)...
-  [00:01:44] [########################################] 1000000/1000000 (0s) Done                                                 
---- Benchmark Summary (DB: InMemory, Format: Rkyv, Workload: Pub/Sub) ---
-Database     | Op Type                  | Ops/sec        | Speed (MB/s)   | Total Traffic  | Avg Lat(ms)  | P99 Lat(ms)  | Errors  
--------------|------------------------|----------------|----------------|----------------|--------------|--------------|----------
-InMemory     | PUBSUB (1000000 Pubs) (Internal) | 9658.74        | 119.76         | 11.547223217785358 GiB | 0.000        | 0.000        | 0
 
 concurrency:
 

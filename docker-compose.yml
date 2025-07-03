@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:latest # Official image, typically multi-arch
@@ -26,6 +24,25 @@ services:
     command: valkey-server --save "" --appendonly no --io-threads 8 --io-threads-do-reads no
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  nats:
+    image: nats:alpine
+    platform: linux/arm64 # Match the platform of other services for consistency
+    container_name: nats_benchmark
+    ports:
+      - "4222:4222" # Client port
+      - "8222:8222" # Monitoring port
+      - "6222:6222" # Routing port for clustering
+    # The default command is sufficient to start the server.
+    # For more advanced configs, like enabling JetStream, you would add:
+    # command: nats-server -js
+    healthcheck:
+      # NATS server responds on the monitoring endpoint when healthy.
+      # The `nats` image doesn't have `wget`, so we use a simple check.
+      test: ["CMD", "nats", "server", "check"]
       interval: 1s
       timeout: 3s
       retries: 30

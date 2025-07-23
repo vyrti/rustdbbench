@@ -80,6 +80,7 @@ If you want to benchmark the custom `rustdb` server, you must start it first.
 
 ```sh
 ./db/target/maxperf/rustdb
+```
 
 By default, it listens on 127.0.0.1:7878. You can change this with the --addr flag.
 2. Run the Benchmarks
@@ -88,22 +89,28 @@ The benchmark tool is highly configurable via command-line arguments.
 
 Example 1: Basic Benchmark (Simple workload)
 Run a Simple GET/SET benchmark against Redis with default settings.
-Generated sh
 
-      
+```sh
 ./kv_benchmark/target/maxperf/kv_benchmark --db redis --workload Simple
+```
 
 Example 2: Compare rustdb, Redis, and Valkey (Chat workload)
 Run a Chat simulation workload, comparing all three key-value stores.
       
 # Run against rustdb
+```sh
 ./kv_benchmark/target/maxperf/kv_benchmark --db RustDb --workload Chat
+```
 
 # Run against Redis
+```sh
 ./kv_benchmark/target/maxperf/kv_benchmark --db Redis --workload Chat
+```
 
 # Run against Valkey
+```sh
 ./kv_benchmark/target/maxperf/kv_benchmark --db Valkey --workload Chat
+```
 
 Example 3: High-Throughput Pipelined Benchmark
 Test maximum WRITE throughput using pipelining with 1 million operations and 1KB JSON values.

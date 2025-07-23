@@ -1,32 +1,36 @@
-## AI Assistance
-This project was developed with assistance from AI coding tools including Claude Sonnet 4 and Gemini Pro 2.5 
+# Rust KV Store & Benchmark Suite
 
-# Rust Database Benchmark
+This project contains two main components:
+1.  **`rustdb`**: A high-performance, multi-threaded, in-memory key-value store, built with Rust and Tokio, that speaks a subset of the Redis (RESP) protocol.
+2.  **`kv_benchmark`**: A comprehensive benchmarking suite to test `rustdb` and compare its performance against other backends like Redis, Valkey, NATS, and WebSockets under various workloads and data formats.
 
-A high-performance, configurable benchmarking tool written in Rust to compare the performance of Redis and Valkey.
-
-This tool is designed to measure throughput (ops/sec) and latency for basic `GET`/`SET` commands while testing the impact of different data serialization formats.
-
-## About
-
-When choosing a key-value store, performance is a critical factor. This project provides a flexible benchmark utility to:
-- Compare the performance of Redis and its community-driven fork, Valkey.
-- Analyze the overhead of different serialization formats (e.g., JSON vs. Protobuf).
-- Simulate various workloads by adjusting concurrency, data size, and command batching (pipelining).
+This project was developed with assistance from AI coding tools.
 
 ## Features
 
-- **Side-by-Side Benchmarking**: Runs the same workload against both Redis and Valkey for direct comparison.
-- **Multiple Serialization Formats**: Natively supports:
-  - `String` (raw bytes)
-  - `JSON` (`serde_json`)
-  - `Bitcode` (a compact binary format)
-  - `Protocol Buffers` (`prost`)
-  - `Rkyv` (for zero-copy deserialization)
-- **Configurable Workloads**: Adjust key/value sizes, number of operations, and concurrency level.
-- **Pipelining Support**: Measure maximum throughput by batching commands in a pipeline.
-- **Latency Metrics**: Optional latency tracking provides average and p99 latency percentiles (not available in pipelined mode).
-- **Zero-Copy Simulation**: A special `zero-copy-read` mode measures raw server/network throughput by skipping the client-side deserialization cost.
+### `rustdb` (In-Memory Server)
+
+-   **High-Performance**: Built on `tokio` for asynchronous I/O and uses high-performance libraries like `parking_lot` for locks and `rustc_hash` for hashing.
+-   **Concurrent**: Multi-threaded architecture to leverage modern multi-core processors.
+-   **Sharded Data Store**: The internal hashmap is sharded to significantly reduce lock contention under high concurrency.
+-   **Redis Protocol Subset**: Supports `GET`, `SET`, `LPUSH`, `LRANGE`, `LTRIM`, and `PING` commands, allowing interaction with standard Redis clients.
+
+### `kv_benchmark` (Benchmark Tool)
+
+-   **Multi-Backend Testing**: Natively supports benchmarking `rustdb`, Redis, Valkey, NATS, and a custom WebSocket server.
+-   **Versatile Workloads**:
+    -   `Simple`: Basic Key-Value `GET`/`SET` operations.
+    -   `Chat`: Simulates a chat application using Redis Lists (`LPUSH`/`LRANGE`).
+    -   `Pub/Sub`: Tests message broadcasting and fan-out performance.
+    -   `WebSocket`: Emulates a real-time chat application over WebSockets to test connection scaling and message passing.
+-   **Serialization Analysis**: Compare the performance impact of different data formats:
+    -   `String` (raw bytes)
+    -   `JSON` (`serde_json`)
+    -   `Bitcode` (compact binary format)
+    -   `Protobuf` (`prost`)
+    -   `Rkyv` & `Flatbuffers` (for zero-copy deserialization)
+-   **Configurable Parameters**: Fine-tune benchmarks by adjusting concurrency, total operations, data size, pipelining, batch sizes, and data compression (zstd).
+-   **Detailed Metrics**: Outputs clear summary tables with throughput (ops/sec), data transfer rates, total time, errors, and optional latency stats (average and p99).
 
 ## Getting Started
 
@@ -43,110 +47,126 @@ When choosing a key-value store, performance is a critical factor. This project 
     cd <repository-directory>
     ```
 
-2.  **Start Databases**
-    Use Docker Compose to spin up Redis and Valkey instances. Redis will be available on port `6379` and Valkey on `6380`.
+2.  **Start Backend Services**
+    Use Docker Compose to start Redis, Valkey, and NATS. This command also pulls the necessary images.
     ```sh
     docker-compose up -d
     ```
-    You can check if they are running with `docker ps`.
+    -   Redis will be available on `127.0.0.1:6379`.
+    -   Valkey will be available on `127.0.0.1:6380`.
+    -   NATS will be available on `127.0.0.1:4222`.
 
-3.  **Build the Benchmark Tool**
-    A build script is provided to compile the project with performance optimizations.
+    > **Note**: The `docker-compose.yml` is configured for `linux/arm64`. If you are on an x86-64 machine, you may need to remove the `platform` line from the `docker-compose.yml` file for each service.
+
+3.  **Build the Project**
+    Convenience scripts are provided to build the server and the benchmark tool with performance optimizations.
+
     ```sh
+    # Build the 'rustdb' server
+    bash builddb.sh
+    
+    # Build the 'kv_benchmark' tool
     bash build.sh
     ```
-    The optimized executable will be located at `kv_benchmark/target/maxperf/kv_benchmark`.
+    The optimized executables will be located at:
+    -   Server: `db/target/maxperf/rustdb`
+    -   Benchmark: `kv_benchmark/target/maxperf/kv_benchmark`
 
-## Usage
+## How to Run
 
-### Command-Line Options
+### 1. Start the `rustdb` Server (Optional)
 
-The tool is configured via command-line arguments.
-
-| Flag                 | Alias | Default                  | Description                                                                    |
-| -------------------- | ----- | ------------------------ | ------------------------------------------------------------------------------ |
-| `--redis-url`        | `-r`  | `redis://127.0.0.1:6379` | Connection URL for Redis.                                                      |
-| `--valkey-url`       | `-v`  | `redis://127.0.0.1:6380` | Connection URL for Valkey.                                                     |
-| `--num-ops`          | `-n`  | `100000`                 | Total number of operations to run.                                             |
-| `--concurrency`      | `-c`  | `50`                     | Number of concurrent client tasks.                                             |
-| `--key-size`         |       | `16`                     | Size of the keys in bytes.                                                     |
-| `--value-size`       |       | `128`                    | Base size of the value in bytes before serialization.                          |
-| `--format`           |       | `string`                 | Data serialization format. Options: `string`, `json`, `bitcode`, `protobuf`, `rkyv`. |
-| `--write-only`       |       | `false`                  | Run only write benchmarks.                                                     |
-| `--read-only`        |       | `false`                  | Run only read benchmarks.                                                      |
-| `--pipeline`         |       | `false`                  | Use explicit pipelining for commands to maximize throughput.                   |
-| `--batch-size`       |       | `50`                     | Batch size for pipelined commands.                                             |
-| `--no-latency`       |       | `false`                  | Skip latency tracking (auto-disabled for pipeline mode).                       |
-| `--zero-copy-read`   |       | `false`                  | Simulate zero-copy reads by skipping/optimizing deserialization.               |
-
-### Examples
-
-**Example 1: Basic Benchmark**
-
-Run a standard benchmark with default settings (100k ops, 50 clients, 128B string values):
+If you want to benchmark the custom `rustdb` server, you must start it first.
 
 ```sh
-./kv_benchmark/target/maxperf/kv_benchmark
-```
+./db/target/maxperf/rustdb
 
----
+By default, it listens on 127.0.0.1:7878. You can change this with the --addr flag.
+2. Run the Benchmarks
 
-**Example 2: High-Throughput Pipelined Benchmark**
+The benchmark tool is highly configurable via command-line arguments.
 
-Test performance with 1 million operations, 100 concurrent clients, 1KB JSON values, and a pipeline batch size of 100:
+Example 1: Basic Benchmark (Simple workload)
+Run a Simple GET/SET benchmark against Redis with default settings.
+Generated sh
 
-```sh
+      
+./kv_benchmark/target/maxperf/kv_benchmark --db redis --workload Simple
+
+Example 2: Compare rustdb, Redis, and Valkey (Chat workload)
+Run a Chat simulation workload, comparing all three key-value stores.
+      
+# Run against rustdb
+./kv_benchmark/target/maxperf/kv_benchmark --db RustDb --workload Chat
+
+# Run against Redis
+./kv_benchmark/target/maxperf/kv_benchmark --db Redis --workload Chat
+
+# Run against Valkey
+./kv_benchmark/target/maxperf/kv_benchmark --db Valkey --workload Chat
+
+Example 3: High-Throughput Pipelined Benchmark
+Test maximum WRITE throughput using pipelining with 1 million operations and 1KB JSON values.
+      
 ./kv_benchmark/target/maxperf/kv_benchmark \
-  -n 1000000 \
-  -c 100 \
+  --db Redis \
+  --workload Simple \
+  --write-only \
+  --num-ops 1000000 \
   --value-size 1024 \
   --format json \
   --pipeline \
   --batch-size 100
-```
 
----
+Example 4: NATS Pub/Sub Benchmark
+Test NATS pub/sub performance with 10 publishers and 90 subscribers.
+      
+./kv_benchmark/target/maxperf/kv_benchmark \
+  --db Nats \
+  --pubsub-only \
+  --num-ops 100000 \
+  --concurrency 100 \
+  --num-publishers 10
 
-**Example 3: Test Rkyv Zero-Copy Read Performance**
+Running the WebSocket Benchmark
 
-Isolate and measure read performance using the rkyv format with zero-copy reads enabled. This test will pre-populate the databases before running the read benchmark.
+The WebSocket benchmark requires running the included Axum-based WebSocket server first.
 
-```sh
-./kv_benchmark/target/maxperf/kv_benchmark --read-only --format rkyv --zero-copy-read
-```
+Step 1: Start the WebSocket Server
+In one terminal, run the benchmark executable with the --run-ws-server flag. We specify --db WebSocketChat to ensure it runs with the correct pub/sub logic.
 
-Note: The following results were captured on a specific machine and are for illustrative purposes. Your mileage will vary based on hardware and workload. All tests were run with -n 100000 -c 100 --pipeline.
+./kv_benchmark/target/maxperf/kv_benchmark --run-ws-server --db WebSocketChat
 
----
+The server will start on 0.0.0.0:3000.
 
-**Test 1: bitcode format, 10KB values**
+Step 2: Run the WebSocket Benchmark Client
+In another terminal, run the client pointed at the server. This test emulates a chat application, measuring the rate at which messages can be published and broadcast to all clients.
 
---format bitcode --value-size 10000
+./kv_benchmark/target/maxperf/kv_benchmark \
+  --db WebSocketChat \
+  --concurrency 100 \
+  --num-ops 100000
 
-Database	Op Type	Ops/sec	Total Time(s)
-Redis	WRITE	70,777.70	1.413
-Redis	READ	145,138.62	0.689
-Valkey	WRITE	75,242.10	1.329
-Valkey	READ	140,158.16	0.713
-Test 2: json format, 10KB values
+## Command-Line Options
 
---format json --value-size 10000
+The following are some of the most common flags. Use `--help` to see the full list.
 
-Database	Op Type	Ops/sec	Total Time(s)
-Redis	WRITE	34,049.54	2.937
-Redis	READ	90,777.11	1.102
-Valkey	WRITE	37,146.46	2.692
-Valkey	READ	107,253.44	0.932
-Test 3: protobuf format, 10KB values, zero-copy read
+| Flag              | Default   | Description                                                                                           |
+| ----------------- | --------- | ----------------------------------------------------------------------------------------------------- |
+| `--db`            | `Redis`   | Database to test. Options: `Redis`, `Valkey`, `RustDb`, `InMemory`, `Nats`, `WebSocketChat`.         |
+| `--workload`      | `Chat`    | Workload type. Options: `Simple`, `Chat`.                                                             |
+| `--num-ops`       | `100000`  | Total number of operations to perform.                                                               |
+| `--concurrency`   | `50`      | Number of concurrent client tasks.                                                                   |
+| `--value-size`    | `128`     | Base size of the value in bytes before serialization.                                               |
+| `--format`        | `String`  | Serialization format: `String`, `Json`, `Bitcode`, `Protobuf`, `Rkyv`, `Flatbuffers`.                 |
+| `--pipeline`      | `false`   | Use explicit pipelining for commands to maximize throughput.                                          |
+| `--batch-size`    | `50`      | Batch size for pipelined commands.                                                                   |
+| `--compress-zstd` | `false`   | Enable zstd compression for payloads.                                                                |
+| `--write-only`    | `false`   | Run only write benchmarks.                                                                           |
+| `--read-only`     | `false`   | Run only read benchmarks.                                                                            |
+| `--pubsub-only`   | `false`   | Run only Pub/Sub benchmarks.                                                                         |
+| `--num-publishers`| `1`       | Number of publisher clients for Pub/Sub benchmarks.                                                  |
+| `--no-latency`    | `false`   | Skip latency tracking to reduce overhead.                                                            |
+| `--run-ws-server` | `false`   | Run the WebSocket server instead of a benchmark client.                                              |
 
---format protobuf --value-size 10000 --zero-copy-read
-
-Database	Op Type	Ops/sec	Total Time(s)
-Redis	WRITE	73,817.73	1.355
-Redis	READ (Zero-Copy)	132,707.57	0.754
-Valkey	WRITE	86,961.77	1.150
-Valkey	READ (Zero-Copy)	136,438.13	0.733
-
-**License**
-
-This project is licensed under the MIT License. See the LICENSE file for details.
+This project is licensed under the [MIT License](LICENSE).

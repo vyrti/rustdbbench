@@ -1,4 +1,3 @@
-// FlatBuffers schema definition for the benchmark payload.
 namespace benchmark_fbs;
 
 table BenchmarkPayload {
